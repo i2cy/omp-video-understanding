@@ -1,0 +1,2230 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 5608547..b1fd168 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -151,6 +151,7 @@ app/api/
+   web-settings/route.ts           GET/PUT omp-web's own server settings (auto-resume, agent tools, agent env, browser transport; a transport change is pushed to every open browser)
+   mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers; `GET ?sessionId=&attach=1` reads a running session's live MCP status and never starts one (a cluster session on another member)
+   plugins/route.ts                GET/POST plugin management (shells out to `omp plugin`); without `cwd`, the user level only (omp runs in the agent directory; a `project` scope POST without `cwd` is 400 `cwd_required`)
++  plugin-config/route.ts          GET manifest config metadata/schema and redacted settings | PUT validate/save | DELETE clear secrets | POST run an installed manifest `omp.actions` declaration; proxy-gated, cwd-allowlisted, CLI-backed
+   projects/route.ts               GET registered+discovered projects | POST add | DELETE hide
+   projects/clone/route.ts         POST clone a git URL into a new workspace (NDJSON progress) | DELETE cancel
+   skills/route.ts                 GET/PATCH loaded skills and disable-model-invocation; GET without `cwd` lists the user level only (`skills/check` and `skills/update` likewise; project scope needs a `cwd`: 400 `cwd_required` from check, `cwd_package_scope_required` from update)
+@@ -1776,7 +1777,8 @@ during the wait.
+ - `GET /api/mcp?sessionId=…&attach=1` returns the live status of a session this server already has running (a remote one included), and otherwise answers `liveError: "The session is not running"` instead of starting one (a cluster session on another member is read where it runs; `McpConfig liveOnly` shows it read-only).
+ 
+ ### Plugins and skills
+-- `/api/plugins` shells out to the user's `omp plugin` CLI (`list/install/uninstall/enable/disable/upgrade`, `--json` where available) — never the Bun-only SDK.
++- `/api/plugins` shells out to the user's `omp plugin` CLI (`list/install/uninstall/enable/disable/upgrade`, `--json` where available) — never the Bun-only SDK. Its `runOmp`, installed-manifest and list/mapping helpers live in `lib/omp/plugin-management.ts`, also used by `/api/plugin-config`; route modules export HTTP handlers only.
++- `/api/plugin-config` lists/reads manifest settings, validates/saves through `omp plugin config`, clears secrets only on an explicit request, and executes installed-manifest `omp.actions`. Project reads/writes pass `--local`; global ones run in the agent directory even when a workspace is selected. Secret values/defaults, action module/export metadata and raw CLI/action errors never reach the browser. `lib/omp/plugin-config.ts` owns scalar validation, scope-keyed Web write serialization, package-root action resolution and the 256 KiB result bound; the Web queue does not replace OMP's cross-process lock.
+ - `/api/skills` lists through `lib/skills-service.ts`, which execs `omp skill list --json` with the project as the process cwd (omp ≥ 18.3.3; never pass the directory as an argument — Windows `.cmd` launchers run through `cmd.exe`, which would interpret `&` in it). That is the same discovery sessions use, including `namespace/name` collision aliases and plugin/registry/custom-directory skills. A pure-Node replica scan (project `.omp/skills` walk-up, `~/.omp/agent/skills`, the `.claude` / `.agent(s)` / `.codex` / `.github` compat dirs, managed skills) is only the fallback for older binaries and failed or malformed output. A failed run is negative-cached per binary fingerprint **and cwd** (5 min) so old installs don't spawn per request while one broken project config cannot degrade the others. Listing runs omp's normal startup, so it has omp's side effects (e.g. omp renames an unparseable `config.yml` aside, as a session would).
+ - Skill toggling edits only the `disable-model-invocation` frontmatter key on the target `SKILL.md`; keep that surgical so user formatting survives. omp reports it back as `hide` (it reads `hide`/`disableModelInvocation`/`disable-model-invocation`). Frontmatter is omp's only per-skill "hide from model, keep `/skill:`" knob; `disabledExtensions: ["skill:<name>"]` removes the skill entirely.
+ - Only user-owned skills are togglable: `getSkillToggleRoots()` (allowed file roots — workspaces the user opened — plus replica scan roots) is the single allowlist for both PATCH and the `togglable` flag GET returns; it is `main`'s pre-CLI allowlist, unchanged. Skills omp lists from anywhere else (the plugin cache, registry installs, custom directories outside a workspace) render a disabled toggle — their files belong to an installer and an update would discard the edit. Never widen PATCH to whatever omp lists.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6ab3cef..dd0b1bf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- **Generic OMP plugin configuration.** Extensions & Tools → Plugins now renders installed manifest string, number, boolean and enum settings, validates and saves them through `omp plugin config`, keeps secrets write-only with explicit clearing, and runs only server-resolved `omp.actions`. The new authenticated `/api/plugin-config` endpoint redacts secret values and command errors, reuses workspace authorization, serializes Web writes by scope, and bounds action JSON results.
++
+ ## [v0.7.3] - 2026-11-18
+ 
+ ### Fixed
+diff --git a/README.md b/README.md
+index ad586a6..8657981 100644
+--- a/README.md
++++ b/README.md
+@@ -1028,6 +1028,7 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
+ - **Linux systemd Service & Tray**: User service that starts at login and restarts on crash, plus a StatusNotifierItem tray icon with service controls (KDE Plasma and compatible desktops).
+ - **Notifications**: Desktop and mobile (PWA) notifications for finished tasks, questions waiting for an answer, failed runs, and automatic model switches, with Web Push when served over HTTPS. See [Notifications](#notifications).
+ - **Web-based Settings** (11 tabs): Interface & Behavior, Safety & Approvals, AI Model Defaults, API Keys & Providers, Usage, Agent & Intelligence (advisor, memory, compaction), Agents, Extensions & Tools (MCP, skills, plugins), Hosts, Notifications, System.
++- **Generic Plugin Configuration**: Extensions & Tools → Plugins renders installed OMP manifest settings, validates/saves them through the OMP CLI, keeps secret values write-only, and exposes only actions declared by the plugin. No plugin-specific protocol logic lives in the browser.
+ - **Slash Commands & Shortcuts**: Quick prompts (`/plan`, `/review`, `/fix`, `/test`, etc.), `⌘K` / `Ctrl+K` palette, and model/reasoning cycling.
+ - **UI Themes & Localization**: Warm paper light/dark themes plus an omp.sh-inspired midnight (`omp`) theme, chat font size & interface scale, with full English, Chinese (简体中文), and Japanese (日本語) translations.
+ 
+diff --git a/app/api/plugin-config/route.test.mjs b/app/api/plugin-config/route.test.mjs
+new file mode 100644
+index 0000000..13877ae
+--- /dev/null
++++ b/app/api/plugin-config/route.test.mjs
+@@ -0,0 +1,214 @@
++import assert from "node:assert/strict";
++import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
++import * as os from "node:os";
++import { join } from "node:path";
++import test, { after } from "node:test";
++import { mock } from "bun:test";
++
++const scratch = realpathSync(mkdtempSync(join(os.tmpdir(), "omp-web-plugin-config-route-")));
++const agentDir = join(scratch, "agent");
++const home = join(scratch, "home");
++const project = join(scratch, "workspace");
++const packageRoot = join(scratch, "installed-plugin");
++const logPath = join(scratch, "calls.jsonl");
++const statePath = join(scratch, "state.json");
++for (const dir of [agentDir, home, project, packageRoot]) mkdirSync(dir, { recursive: true });
++writeFileSync(logPath, "");
++writeFileSync(statePath, JSON.stringify({ settings: { token: "raw-secret", name: "before", retries: 2, enabled: true, mode: "safe" } }));
++
++const manifest = {
++  version: "1.0.0",
++  settings: {
++    name: { type: "string", default: "demo", description: "Display name" },
++    retries: { type: "number", min: 1, max: 3 },
++    enabled: { type: "boolean" },
++    mode: { type: "enum", values: ["fast", "safe"] },
++    token: { type: "string", secret: true, default: "secret-default-must-not-leak" },
++  },
++  actions: {
++    check: { module: "./action.mjs", export: "check", description: "Run the installed check" },
++    explode: { module: "./action.mjs", export: "explode", description: "Fail safely" },
++    cancel: { module: "./action.mjs", export: "cancel", description: "Cancel safely" },
++  },
++};
++writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "fixture-plugin", version: "1.0.0", omp: manifest }));
++writeFileSync(join(packageRoot, "action.mjs"), `export async function check(cwd, signal) { return { source: "installed-plugin", cwd, signalled: signal instanceof AbortSignal }; }
++export async function explode() { throw new Error("action leaked raw-secret"); }
++export async function cancel() { throw new DOMException("cancelled raw-secret", "AbortError"); }
++`);
++writeFileSync(join(scratch, "plugins.json"), JSON.stringify({
++  npm: [{ name: "fixture-plugin", version: "1.0.0", path: packageRoot, enabled: true, manifest }],
++  marketplace: [{ id: "fixture-plugin@market", scope: "project", entries: [{ scope: "project", installPath: packageRoot, version: "1.0.0", enabled: true }] }],
++}));
++
++const fakeOmp = join(scratch, "fake-omp.mjs");
++writeFileSync(fakeOmp, `#!/usr/bin/env node
++import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
++const args = process.argv.slice(2);
++appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ cwd: process.cwd(), args }) + "\\n");
++const state = JSON.parse(readFileSync(${JSON.stringify(statePath)}, "utf8"));
++if (args[0] === "plugin" && args[1] === "list") {
++  process.stdout.write(readFileSync(${JSON.stringify(join(scratch, "plugins.json"))}, "utf8"));
++} else if (args[0] === "plugin" && args[1] === "config" && args[2] === "list") {
++  process.stdout.write(JSON.stringify({ settings: state.settings, schema: {} }));
++} else if (args[0] === "plugin" && args[1] === "config" && args[2] === "set") {
++  const [,,,, key, value] = args;
++  if (value === "trigger-cli-error") {
++    process.stderr.write("command included raw-secret and secret-default-must-not-leak");
++    process.exit(1);
++  }
++  state.settings[key] = key === "retries" ? Number(value) : key === "enabled" ? value === "true" : value;
++  writeFileSync(${JSON.stringify(statePath)}, JSON.stringify(state));
++} else if (args[0] === "plugin" && args[1] === "config" && args[2] === "delete") {
++  delete state.settings[args[4]];
++  writeFileSync(${JSON.stringify(statePath)}, JSON.stringify(state));
++} else {
++  process.stderr.write("unexpected invocation");
++  process.exit(2);
++}
++`);
++chmodSync(fakeOmp, 0o755);
++
++const ENV_KEYS = ["OMP_WEB_OMP_BIN", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "HOME", "USERPROFILE"];
++const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
++process.env.OMP_WEB_OMP_BIN = fakeOmp;
++process.env.PI_CODING_AGENT_DIR = agentDir;
++process.env.HOME = process.env.USERPROFILE = home;
++delete process.env.PI_CONFIG_DIR;
++const scratchOs = { ...os, homedir: () => home };
++mock.module("os", () => ({ ...scratchOs, default: scratchOs }));
++mock.module("node:os", () => ({ ...scratchOs, default: scratchOs }));
++const { allowFileRoot } = await import("../../../lib/file-access.ts");
++allowFileRoot(project);
++const route = await import("./route.ts");
++
++after(() => {
++  for (const [key, value] of Object.entries(saved)) {
++    if (value === undefined) delete process.env[key];
++    else process.env[key] = value;
++  }
++  rmSync(scratch, { recursive: true, force: true });
++});
++
++const skip = process.platform === "win32";
++const calls = () => readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
++const resetCalls = () => writeFileSync(logPath, "");
++const url = (query = "") => `http://localhost/api/plugin-config${query}`;
++const request = (method, body) => new Request(url(), { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
++const target = { source: "fixture-plugin", scope: "global", cwd: project };
++
++test("list/get expose schema and action metadata but never a secret value or default", { skip }, async () => {
++  const listed = await route.GET(new Request(url()));
++  assert.equal(listed.status, 200);
++  const listBody = await listed.text();
++  assert.doesNotMatch(listBody, /raw-secret|secret-default-must-not-leak|action\.mjs|export/);
++  const parsed = JSON.parse(listBody);
++  assert.deepEqual(parsed.plugins[0].actions, {
++    check: { description: "Run the installed check" },
++    explode: { description: "Fail safely" },
++    cancel: { description: "Cancel safely" },
++  });
++
++  const response = await route.GET(new Request(url(`?${new URLSearchParams(target)}`)));
++  assert.equal(response.status, 200);
++  const text = await response.text();
++  assert.doesNotMatch(text, /raw-secret|secret-default-must-not-leak/);
++  const body = JSON.parse(text);
++  assert.deepEqual(body.settings.token, { configured: true, redacted: true });
++  assert.equal(body.settings.name, "before");
++  assert.equal(Object.hasOwn(body.schema.token, "default"), false);
++});
++
++test("blank secrets are preserved on validate/save and unknown keys write nothing", { skip }, async () => {
++  resetCalls();
++  const settings = { name: "after", retries: 3, enabled: false, mode: "fast", token: "" };
++  const validated = await route.PUT(request("PUT", { ...target, settings, clearSecrets: [], validateOnly: true }));
++  assert.equal(validated.status, 200);
++  assert.deepEqual(await validated.json(), { valid: true, errors: [] });
++  assert.equal(calls().some((call) => call.args[2] === "set"), false);
++
++  const savedResponse = await route.PUT(request("PUT", { ...target, settings, clearSecrets: [] }));
++  assert.equal(savedResponse.status, 200);
++  const body = await savedResponse.json();
++  assert.equal(body.config.settings.name, "after");
++  assert.equal(body.config.settings.retries, 3);
++  assert.equal(body.config.settings.enabled, false);
++  assert.deepEqual(body.config.settings.token, { configured: true, redacted: true });
++  const writes = calls().filter((call) => call.args[2] === "set");
++  assert.equal(writes.some((call) => call.args[4] === "token"), false);
++  assert.equal(writes.every((call) => call.cwd === agentDir), true);
++
++  const beforeUnknown = calls().length;
++  const unknown = await route.PUT(request("PUT", { ...target, settings: { unknown: "value" }, clearSecrets: [] }));
++  assert.equal(unknown.status, 400);
++  assert.equal((await unknown.json()).errors[0].code, "unknown_setting");
++  assert.equal(calls().length, beforeUnknown + 1, "only the installed-plugin list ran; no config command or write");
++});
++
++test("only an explicit clear deletes a secret, and CLI failures are redacted", { skip }, async () => {
++  resetCalls();
++  const failed = await route.PUT(request("PUT", { ...target, settings: { name: "trigger-cli-error" }, clearSecrets: [] }));
++  assert.equal(failed.status, 500);
++  const failureText = await failed.text();
++  assert.doesNotMatch(failureText, /raw-secret|secret-default-must-not-leak/);
++  assert.deepEqual(JSON.parse(failureText), { error: "Plugin configuration operation failed", code: "plugin_config_failed" });
++
++  const response = await route.DELETE(request("DELETE", { ...target, settings: {}, clearSecrets: ["token"] }));
++  assert.equal(response.status, 200);
++  const body = await response.json();
++  assert.deepEqual(body.config.settings.token, { configured: false, redacted: true });
++  assert.equal(calls().some((call) => call.args[2] === "delete" && call.args[4] === "token"), true);
++  const nonSecret = await route.DELETE(request("DELETE", { ...target, settings: {}, clearSecrets: ["name"] }));
++  assert.equal(nonSecret.status, 400);
++  assert.equal((await nonSecret.json()).errors[0].code, "not_a_secret");
++});
++
++test("actions are looked up in the installed manifest and run with the authorized cwd", { skip }, async () => {
++  const unknown = await route.POST(request("POST", { ...target, actionId: "not-declared" }));
++  assert.equal(unknown.status, 404);
++  assert.equal((await unknown.json()).code, "unknown_action");
++
++  const injected = await route.POST(request("POST", { ...target, actionId: "check", module: "/tmp/evil.mjs", export: "evil" }));
++  assert.equal(injected.status, 400);
++  assert.equal((await injected.json()).code, "invalid_action_request");
++
++  const response = await route.POST(request("POST", { ...target, actionId: "check" }));
++  assert.equal(response.status, 200);
++  const body = await response.json();
++  assert.equal(body.actionId, "check");
++  assert.deepEqual(body.result, { source: "installed-plugin", cwd: project, signalled: true });
++  assert.equal(typeof body.completedAt, "string");
++});
++
++test("action exceptions and cancellation are structured and redacted", { skip }, async () => {
++  const failed = await route.POST(request("POST", { ...target, actionId: "explode" }));
++  assert.equal(failed.status, 500);
++  const failureText = await failed.text();
++  assert.doesNotMatch(failureText, /raw-secret/);
++  assert.deepEqual(JSON.parse(failureText), { error: "Plugin configuration operation failed", code: "plugin_config_failed" });
++
++  const cancelled = await route.POST(request("POST", { ...target, actionId: "cancel" }));
++  assert.equal(cancelled.status, 408);
++  const cancelText = await cancelled.text();
++  assert.doesNotMatch(cancelText, /raw-secret/);
++  assert.deepEqual(JSON.parse(cancelText), { error: "Plugin action was cancelled", code: "action_aborted" });
++});
++
++test("project settings use OMP local overrides in the authorized workspace", { skip }, async () => {
++  resetCalls();
++  const projectTarget = { source: "fixture-plugin@market", scope: "project", cwd: project };
++  const response = await route.PUT(request("PUT", { ...projectTarget, settings: { name: "project-value" }, clearSecrets: [] }));
++  assert.equal(response.status, 200);
++  const configCalls = calls().filter((call) => call.args[1] === "config");
++  assert.equal(configCalls.length > 0, true);
++  assert.equal(configCalls.every((call) => call.cwd === project), true);
++  assert.equal(configCalls.every((call) => call.args.includes("--local")), true);
++});
++
++test("an unauthorized workspace is rejected before OMP or an action runs", { skip }, async () => {
++  resetCalls();
++  const response = await route.POST(request("POST", { ...target, cwd: join(scratch, "not-allowed"), actionId: "check" }));
++  assert.equal(response.status, 403);
++  assert.equal((await response.json()).code, "access_denied");
++  assert.equal(calls().length, 0);
++});
+diff --git a/app/api/plugin-config/route.ts b/app/api/plugin-config/route.ts
+new file mode 100644
+index 0000000..b33f3c3
+--- /dev/null
++++ b/app/api/plugin-config/route.ts
+@@ -0,0 +1,210 @@
++import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
++import type {
++  PluginConfigListResponse,
++  PluginConfigResponse,
++  PluginPackageInfo,
++  PluginScope,
++} from "@/lib/api-types";
++import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
++import { ensureAgentDir } from "@/lib/omp/paths";
++import { parseJsonLoose } from "@/lib/omp/plugins-cli";
++import {
++  executePluginAction,
++  publicPluginSettings,
++  serializePluginActionPayload,
++  serializePluginWrite,
++  validatePluginSettings,
++  validateSecretClears,
++} from "@/lib/omp/plugin-config";
++import { isRecord } from "@/lib/type-guards";
++import { readInstalledManifest, readPlugins, runOmp } from "@/lib/omp/plugin-management";
++
++const MAX_CONFIG_REQUEST_BYTES = 256 * 1024;
++
++interface PluginTarget {
++  source: string;
++  scope: PluginScope;
++  cwd: string | null;
++  actionCwd: string;
++  configCwd: string;
++  pkg: PluginPackageInfo;
++}
++
++class ConfigRouteError extends Error {
++  constructor(readonly status: number, readonly code: string, message: string) {
++    super(message);
++  }
++}
++
++function jsonError(error: unknown): Response {
++  if (error instanceof ConfigRouteError) return Response.json({ error: error.message, code: error.code }, { status: error.status });
++  if (error instanceof RequestBodyTooLargeError) return Response.json({ error: "Plugin configuration request is too large", code: "request_too_large" }, { status: 413 });
++  if (error instanceof SyntaxError) return Response.json({ error: "Invalid JSON request", code: "invalid_json" }, { status: 400 });
++  // CLI stdout/stderr and action exceptions can contain credentials. Never
++  // forward their messages, and do not copy them into ordinary server logs.
++  return Response.json({ error: "Plugin configuration operation failed", code: "plugin_config_failed" }, { status: 500 });
++}
++
++function readScope(value: unknown): PluginScope {
++  if (value === undefined || value === null || value === "global") return "global";
++  if (value === "project") return "project";
++  throw new ConfigRouteError(400, "invalid_scope", "scope must be global or project");
++}
++
++async function resolveTarget(sourceValue: unknown, scopeValue: unknown, cwdValue: unknown): Promise<PluginTarget> {
++  if (typeof sourceValue !== "string" || !sourceValue.trim()) throw new ConfigRouteError(400, "source_required", "source is required");
++  const source = sourceValue.trim();
++  const scope = readScope(scopeValue);
++  if (cwdValue !== undefined && cwdValue !== null && (typeof cwdValue !== "string" || !cwdValue.trim())) {
++    throw new ConfigRouteError(400, "invalid_cwd", "cwd must be a workspace path");
++  }
++  const cwd = typeof cwdValue === "string" ? cwdValue : null;
++  if (scope === "project" && !cwd) throw new ConfigRouteError(400, "cwd_required", "cwd is required for project scope");
++  if (cwd && !isExistingFilePathAllowed(cwd, await getAllowedFileRoots())) {
++    throw new ConfigRouteError(403, "access_denied", "Workspace is not allowed");
++  }
++
++  const pkg = (await readPlugins(cwd)).packages.find((candidate) => candidate.source === source && candidate.scope === scope);
++  if (!pkg) throw new ConfigRouteError(404, "plugin_not_found", "Installed plugin not found");
++  return {
++    source,
++    scope,
++    cwd,
++    actionCwd: cwd ?? ensureAgentDir(),
++    // A user-level read/write must not accidentally resolve a project's
++    // overrides merely because the selected UI workspace supplied a cwd.
++    configCwd: scope === "project" ? cwd! : ensureAgentDir(),
++    pkg,
++  };
++}
++
++async function readConfig(target: PluginTarget): Promise<PluginConfigResponse> {
++  const scopeArgs = target.scope === "project" ? ["--local"] : [];
++  const { stdout } = await runOmp(["plugin", "config", "list", target.source, "--json", ...scopeArgs], { cwd: target.configCwd, timeout: 60_000 });
++  const parsed = parseJsonLoose<unknown>(stdout);
++  if (!isRecord(parsed) || !isRecord(parsed.settings)) throw new ConfigRouteError(502, "invalid_omp_response", "OMP returned an invalid plugin configuration");
++  const schema = target.pkg.settings ?? {};
++  return {
++    source: target.source,
++    scope: target.scope,
++    schema,
++    settings: publicPluginSettings(schema, parsed.settings),
++    actions: target.pkg.actions ?? {},
++  };
++}
++
++interface ConfigWriteBody {
++  source?: unknown;
++  scope?: unknown;
++  cwd?: unknown;
++  settings?: unknown;
++  clearSecrets?: unknown;
++  validateOnly?: unknown;
++}
++
++function readWriteBody(body: ConfigWriteBody): { settings: Record<string, unknown>; clearSecrets: string[]; validateOnly: boolean } {
++  if (!isRecord(body.settings)) throw new ConfigRouteError(400, "settings_required", "settings must be an object");
++  if (body.clearSecrets !== undefined && (!Array.isArray(body.clearSecrets) || !body.clearSecrets.every((key) => typeof key === "string"))) {
++    throw new ConfigRouteError(400, "invalid_secret_clear", "clearSecrets must be an array of setting keys");
++  }
++  if (body.validateOnly !== undefined && typeof body.validateOnly !== "boolean") {
++    throw new ConfigRouteError(400, "invalid_validate_only", "validateOnly must be a boolean");
++  }
++  return { settings: body.settings, clearSecrets: (body.clearSecrets ?? []) as string[], validateOnly: body.validateOnly === true };
++}
++
++async function writeConfig(body: ConfigWriteBody, forceClearOnly: boolean): Promise<Response> {
++  const { settings, clearSecrets, validateOnly } = readWriteBody(body);
++  if (forceClearOnly && (Object.keys(settings).length > 0 || clearSecrets.length === 0)) {
++    throw new ConfigRouteError(400, "secret_clear_required", "DELETE requires only a non-empty clearSecrets array");
++  }
++  const target = await resolveTarget(body.source, body.scope, body.cwd);
++  const schema = target.pkg.settings ?? {};
++  const errors = [...validatePluginSettings(schema, settings, { preserveBlankSecrets: true }), ...validateSecretClears(schema, clearSecrets)];
++  for (const key of clearSecrets) {
++    if (Object.hasOwn(settings, key) && settings[key] !== "") errors.push({ key, code: "invalid_setting", message: "A secret cannot be set and cleared in the same request" });
++  }
++  if (errors.length > 0) return Response.json({ valid: false, errors }, { status: 400 });
++  if (validateOnly) return Response.json({ valid: true, errors: [] });
++
++  const config = await serializePluginWrite(target.scope, target.cwd, async () => {
++    const scopeArgs = target.scope === "project" ? ["--local"] : [];
++    for (const [key, value] of Object.entries(settings)) {
++      if (schema[key]?.secret && value === "") continue;
++      await runOmp(["plugin", "config", "set", target.source, key, String(value), ...scopeArgs], { cwd: target.configCwd, timeout: 60_000 });
++    }
++    for (const key of new Set(clearSecrets)) {
++      await runOmp(["plugin", "config", "delete", target.source, key, ...scopeArgs], { cwd: target.configCwd, timeout: 60_000 });
++    }
++    return readConfig(target);
++  });
++  return Response.json({ valid: true, errors: [], config });
++}
++
++export async function GET(req: Request): Promise<Response> {
++  try {
++    const params = new URL(req.url).searchParams;
++    const source = params.get("source");
++    const scope = params.get("scope") ?? undefined;
++    const cwd = params.get("cwd");
++    if (!source) {
++      if (cwd && !isExistingFilePathAllowed(cwd, await getAllowedFileRoots())) throw new ConfigRouteError(403, "access_denied", "Workspace is not allowed");
++      const { packages } = await readPlugins(cwd);
++      const response: PluginConfigListResponse = {
++        plugins: packages.map((pkg) => ({ source: pkg.source, scope: pkg.scope, schema: pkg.settings ?? {}, actions: pkg.actions ?? {} })),
++      };
++      return Response.json(response);
++    }
++    return Response.json(await readConfig(await resolveTarget(source, scope, cwd)));
++  } catch (error) {
++    return jsonError(error);
++  }
++}
++
++export async function PUT(req: Request): Promise<Response> {
++  try {
++    return await writeConfig(await parseJsonWithinLimit<ConfigWriteBody>(req, MAX_CONFIG_REQUEST_BYTES), false);
++  } catch (error) {
++    return jsonError(error);
++  }
++}
++
++export async function DELETE(req: Request): Promise<Response> {
++  try {
++    return await writeConfig(await parseJsonWithinLimit<ConfigWriteBody>(req, MAX_CONFIG_REQUEST_BYTES), true);
++  } catch (error) {
++    return jsonError(error);
++  }
++}
++
++export async function POST(req: Request): Promise<Response> {
++  try {
++    const body = await parseJsonWithinLimit<ConfigWriteBody & { actionId?: unknown }>(req, MAX_CONFIG_REQUEST_BYTES);
++    if (Object.hasOwn(body, "module") || Object.hasOwn(body, "export") || Object.hasOwn(body, "command")) {
++      throw new ConfigRouteError(400, "invalid_action_request", "Plugin actions accept only an actionId");
++    }
++    if (typeof body.actionId !== "string" || !body.actionId) throw new ConfigRouteError(400, "action_required", "actionId is required");
++    const target = await resolveTarget(body.source, body.scope, body.cwd);
++    if (!target.pkg.installedPath) throw new ConfigRouteError(404, "plugin_not_installed", "Plugin package is not installed");
++    const manifest = await readInstalledManifest(target.pkg.installedPath);
++    const declaration = manifest?.actions && Object.hasOwn(manifest.actions, body.actionId) ? manifest.actions[body.actionId] : undefined;
++    if (!declaration) throw new ConfigRouteError(404, "unknown_action", "Plugin action is not declared by the installed manifest");
++    const result = await executePluginAction(target.pkg.installedPath, declaration, target.actionCwd, req.signal);
++    if (result === undefined || typeof result === "function" || typeof result === "symbol") {
++      return Response.json({ error: "Plugin action returned a non-JSON result", code: "invalid_action_result" }, { status: 502 });
++    }
++    const json = serializePluginActionPayload({ actionId: body.actionId, result, completedAt: new Date().toISOString() });
++    return new Response(json, { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
++  } catch (error) {
++    if (req.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
++      return Response.json({ error: "Plugin action was cancelled", code: "action_aborted" }, { status: 408 });
++    }
++    if (error instanceof Error && error.message === "Plugin action returned a non-JSON result") {
++      return Response.json({ error: "Plugin action returned a non-JSON result", code: "invalid_action_result" }, { status: 502 });
++    }
++    if (error instanceof Error && error.message === "Plugin action result is not bounded JSON") {
++      return Response.json({ error: "Plugin action result is not bounded JSON", code: "action_result_too_large" }, { status: 413 });
++    }
++    return jsonError(error);
++  }
++}
+diff --git a/app/api/plugins/route.ts b/app/api/plugins/route.ts
+index 2e76178..2cd9c57 100644
+--- a/app/api/plugins/route.ts
++++ b/app/api/plugins/route.ts
+@@ -1,253 +1,11 @@
+-import { execFile } from "child_process";
+-import { existsSync, promises as fs } from "fs";
+-import { basename, extname, join } from "path";
+-import { ANSI_RE, parseJsonLoose } from "@/lib/omp/plugins-cli";
+-import { OMP_NOT_FOUND, resolveOmpBin } from "@/lib/omp/omp-cli";
+-import { ensureAgentDir } from "@/lib/omp/paths";
+-import { createChildProcessEnvironment } from "@/lib/project-command-env";
+ import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
+-import type {
+-  PluginDiagnostic,
+-  PluginPackageInfo,
+-  PluginResourceCounts,
+-  PluginResourceInfo,
+-  PluginScope,
+-  PluginsResponse,
+-} from "@/lib/api-types";
+-
+-// Plugin management is delegated to the user's omp binary (`omp plugin ...`);
+-// omp-web never embeds the Bun-only SDK. `--json` output shapes are mirrored
+-// from oh-my-pi coding-agent src/cli/plugin-cli.ts + extensibility/plugins.
++import { OMP_NOT_FOUND } from "@/lib/omp/omp-cli";
++import { ensureAgentDir } from "@/lib/omp/paths";
++import { readPlugins, runOmp } from "@/lib/omp/plugin-management";
++import type { PluginScope } from "@/lib/api-types";
+ 
+ type PluginAction = "install" | "remove" | "update" | "disable" | "enable";
+ 
+-interface OmpPluginManifest {
+-  name?: string;
+-  version?: string;
+-  description?: string;
+-  tools?: string;
+-  hooks?: string;
+-  extensions?: string[];
+-  commands?: string[];
+-  features?: Record<string, unknown>;
+-}
+-
+-interface OmpNpmPlugin {
+-  name: string;
+-  version: string;
+-  path: string;
+-  manifest?: OmpPluginManifest;
+-  enabledFeatures?: string[] | null;
+-  enabled: boolean;
+-}
+-
+-interface OmpMarketplaceEntry {
+-  scope?: "user" | "project";
+-  installPath?: string;
+-  version?: string;
+-  enabled?: boolean;
+-}
+-
+-interface OmpMarketplacePlugin {
+-  id: string;
+-  scope?: "user" | "project";
+-  entries?: OmpMarketplaceEntry[];
+-  shadowedBy?: string;
+-}
+-
+-interface OmpPluginList {
+-  npm?: OmpNpmPlugin[];
+-  marketplace?: OmpMarketplacePlugin[];
+-}
+-
+-function emptyCounts(): PluginResourceCounts {
+-  return { extensions: 0, skills: 0, prompts: 0, themes: 0 };
+-}
+-
+-function runOmp(
+-  args: string[],
+-  opts: { cwd?: string; timeout?: number } = {},
+-): Promise<{ stdout: string; stderr: string }> {
+-  const bin = resolveOmpBin();
+-  if (!bin) {
+-    return Promise.reject(new Error(OMP_NOT_FOUND));
+-  }
+-  return new Promise((resolve, reject) => {
+-    execFile(
+-      bin,
+-      args,
+-      {
+-        cwd: opts.cwd,
+-        timeout: opts.timeout ?? 60_000,
+-        maxBuffer: 16 * 1024 * 1024,
+-        env: createChildProcessEnvironment({ FORCE_COLOR: "0", NO_COLOR: "1" }),
+-        windowsHide: true,
+-      },
+-      (error, stdout, stderr) => {
+-        if (error) {
+-          const detail = (stderr || stdout || error.message).replace(ANSI_RE, "").trim();
+-          reject(new Error(detail.slice(-600) || `omp ${args.join(" ")} failed`));
+-        } else {
+-          resolve({ stdout, stderr });
+-        }
+-      },
+-    );
+-  });
+-}
+-
+-/** Best-effort scan of a plugin's skills/ directory (omp discovers plugin-root
+- * skills the same way) so the UI can show a resource count. */
+-async function scanPluginSkills(pluginPath: string): Promise<PluginResourceInfo[]> {
+-  const skillsDir = join(pluginPath, "skills");
+-  let entries;
+-  try {
+-    const readDirectory = Reflect.get(fs, "readdir") as typeof fs.readdir;
+-    entries = await readDirectory(skillsDir, { withFileTypes: true });
+-  } catch {
+-    return [];
+-  }
+-  const resources: PluginResourceInfo[] = [];
+-  for (const entry of entries) {
+-    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
+-    const skillPath = join(skillsDir, entry.name, "SKILL.md");
+-    if (existsSync(skillPath)) {
+-      resources.push({
+-        kind: "skill",
+-        name: entry.name,
+-        path: skillPath,
+-        relativePath: join("skills", entry.name, "SKILL.md"),
+-      });
+-    }
+-  }
+-  return resources;
+-}
+-
+-function manifestResources(pluginPath: string, manifest: OmpPluginManifest | undefined): PluginResourceInfo[] {
+-  const resources: PluginResourceInfo[] = [];
+-  const push = (kind: PluginResourceInfo["kind"], rel: string) => {
+-    const file = basename(rel);
+-    const ext = extname(file);
+-    resources.push({
+-      kind,
+-      name: ext ? file.slice(0, -ext.length) : file,
+-      path: join(pluginPath, rel),
+-      relativePath: rel,
+-    });
+-  };
+-  for (const rel of manifest?.extensions ?? []) push("extension", rel);
+-  if (manifest?.tools) push("extension", manifest.tools);
+-  if (manifest?.hooks) push("extension", manifest.hooks);
+-  // omp "commands" (slash commands) are the closest analog of pi prompts.
+-  for (const rel of manifest?.commands ?? []) push("prompt", rel);
+-  return resources;
+-}
+-
+-async function toNpmPackageInfo(plugin: OmpNpmPlugin): Promise<PluginPackageInfo> {
+-  const resources = [
+-    ...manifestResources(plugin.path, plugin.manifest),
+-    ...(await scanPluginSkills(plugin.path)),
+-  ];
+-  const counts = emptyCounts();
+-  for (const resource of resources) {
+-    if (resource.kind === "extension") counts.extensions += 1;
+-    else if (resource.kind === "skill") counts.skills += 1;
+-    else if (resource.kind === "prompt") counts.prompts += 1;
+-    else counts.themes += 1;
+-  }
+-  const installed = Boolean(plugin.path && existsSync(plugin.path));
+-  const resourceCount = counts.extensions + counts.skills + counts.prompts + counts.themes;
+-  return {
+-    source: plugin.name,
+-    scope: "global",
+-    filtered: Array.isArray(plugin.enabledFeatures),
+-    disabled: plugin.enabled === false,
+-    installedPath: plugin.path || undefined,
+-    packageName: plugin.name,
+-    version: plugin.version || plugin.manifest?.version,
+-    configuredVersion: undefined,
+-    counts,
+-    resources,
+-    status: plugin.enabled === false
+-      ? "disabled"
+-      : resourceCount > 0
+-        ? "loaded"
+-        : installed
+-          ? "installed"
+-          : "missing",
+-  };
+-}
+-
+-async function toMarketplacePackageInfo(plugin: OmpMarketplacePlugin): Promise<PluginPackageInfo> {
+-  const entry = plugin.entries?.[0];
+-  const installedPath = entry?.installPath;
+-  const installed = Boolean(installedPath && existsSync(installedPath));
+-  const resources = installedPath ? await scanPluginSkills(installedPath) : [];
+-  const counts = emptyCounts();
+-  counts.skills = resources.length;
+-  const disabled = entry?.enabled === false;
+-  return {
+-    source: plugin.id,
+-    scope: plugin.scope === "project" ? "project" : "global",
+-    filtered: false,
+-    disabled,
+-    installedPath: installedPath || undefined,
+-    packageName: plugin.id,
+-    version: entry?.version,
+-    configuredVersion: undefined,
+-    counts,
+-    resources,
+-    status: disabled ? "disabled" : resources.length > 0 ? "loaded" : installed ? "installed" : "missing",
+-  };
+-}
+-
+-/** Without a cwd, the user level only (a cluster member's settings act on this machine's, spec K7): omp runs in its
+- * agent directory, where no project lies, and a project-scope entry is left out all the same. */
+-async function readPlugins(cwd: string | null): Promise<PluginsResponse> {
+-  const diagnostics: PluginDiagnostic[] = [];
+-  const packages: PluginPackageInfo[] = [];
+-  const totals = emptyCounts();
+-
+-  try {
+-    const { stdout } = await runOmp(["plugin", "list", "--json"], { cwd: cwd ?? ensureAgentDir(), timeout: 60_000 });
+-    const list = parseJsonLoose<OmpPluginList>(stdout);
+-    if (!list) {
+-      diagnostics.push({
+-        type: "error",
+-        message: "Could not parse `omp plugin list --json` output.",
+-      });
+-    } else {
+-      for (const plugin of list.npm ?? []) {
+-        packages.push(await toNpmPackageInfo(plugin));
+-      }
+-      for (const plugin of list.marketplace ?? []) {
+-        if (!cwd && plugin.scope === "project") continue;
+-        const info = await toMarketplacePackageInfo(plugin);
+-        if (plugin.shadowedBy) {
+-          diagnostics.push({
+-            type: "warning",
+-            source: plugin.id,
+-            message: `Shadowed by a ${plugin.shadowedBy}-scoped install of the same plugin.`,
+-          });
+-        }
+-        packages.push(info);
+-      }
+-      for (const pkg of packages) {
+-        totals.extensions += pkg.counts.extensions;
+-        totals.skills += pkg.counts.skills;
+-        totals.prompts += pkg.counts.prompts;
+-        totals.themes += pkg.counts.themes;
+-      }
+-    }
+-  } catch (error) {
+-    diagnostics.push({
+-      type: "error",
+-      message: error instanceof Error ? error.message : String(error),
+-    });
+-  }
+-
+-  return { packages, totals, diagnostics };
+-}
+-
+ function readScope(scope: unknown): PluginScope {
+   return scope === "project" ? "project" : "global";
+ }
+diff --git a/components/PluginSettingsForm.test.mjs b/components/PluginSettingsForm.test.mjs
+new file mode 100644
+index 0000000..e91e804
+--- /dev/null
++++ b/components/PluginSettingsForm.test.mjs
+@@ -0,0 +1,167 @@
++import "../tests/setup-dom.mjs";
++import assert from "node:assert/strict";
++import test, { afterEach } from "node:test";
++import { createElement } from "react";
++const { cleanup, render, screen, waitFor } = await import("@testing-library/react/pure.js");
++const { default: userEvent } = await import("@testing-library/user-event");
++const { PluginSettingsForm } = await import("./PluginSettingsForm.tsx");
++
++afterEach(cleanup);
++
++const pkg = {
++  source: "fixture-plugin",
++  scope: "global",
++  filtered: false,
++  disabled: false,
++  installedPath: "/plugins/fixture-plugin",
++  packageName: "fixture-plugin",
++  counts: { extensions: 0, skills: 0, prompts: 0, themes: 0 },
++  resources: [],
++  status: "installed",
++  settings: {
++    name: { type: "string", description: "Display name" },
++    retries: { type: "number", min: 1, max: 3, step: 1 },
++    enabled: { type: "boolean" },
++    mode: { type: "enum", values: ["fast", "safe"] },
++    token: { type: "string", secret: true },
++  },
++  actions: { check: { description: "Run the installed check" } },
++};
++const cwd = "/workspace";
++
++function config() {
++  return {
++    source: pkg.source,
++    scope: pkg.scope,
++    schema: pkg.settings,
++    settings: {
++      name: "before",
++      retries: 2,
++      enabled: true,
++      mode: "safe",
++      token: { configured: true, redacted: true },
++    },
++    actions: pkg.actions,
++  };
++}
++
++test("schema renders every scalar type, validates/saves typed values, and preserves a blank secret", async (t) => {
++  let current = config();
++  const writes = [];
++  t.mock.method(globalThis, "fetch", async (url, init) => {
++    const method = init?.method ?? "GET";
++    if (method === "GET") return Response.json(current);
++    const body = JSON.parse(init.body);
++    if (method === "PUT") {
++      writes.push(body);
++      if (!body.validateOnly) {
++        current = {
++          ...current,
++          settings: {
++            name: body.settings.name,
++            retries: body.settings.retries,
++            enabled: body.settings.enabled,
++            mode: body.settings.mode,
++            token: { configured: true, redacted: true },
++          },
++        };
++      }
++      return Response.json({ valid: true, errors: [], ...(body.validateOnly ? {} : { config: current }) });
++    }
++    throw new Error(`Unexpected ${method} ${url}`);
++  });
++
++  render(createElement(PluginSettingsForm, { pkg, cwd }));
++  const user = userEvent.setup();
++  const name = await screen.findByRole("textbox", { name: "name" });
++  assert.ok(screen.getByRole("spinbutton", { name: "retries" }));
++  assert.ok(screen.getByRole("checkbox", { name: "enabled" }));
++  assert.ok(screen.getByRole("combobox", { name: "mode" }));
++  const secret = screen.getByLabelText("token");
++  assert.equal(secret.type, "password");
++  assert.equal(secret.value, "");
++  assert.ok(screen.getByText("Configured · redacted"));
++  assert.equal(document.body.textContent.includes("raw-secret"), false);
++
++  await user.clear(name);
++  await user.type(name, "after");
++  await user.clear(screen.getByRole("spinbutton", { name: "retries" }));
++  await user.type(screen.getByRole("spinbutton", { name: "retries" }), "3");
++  await user.click(screen.getByRole("checkbox", { name: "enabled" }));
++  await user.selectOptions(screen.getByRole("combobox", { name: "mode" }), "fast");
++  await user.click(screen.getByRole("button", { name: "Validate settings" }));
++  await waitFor(() => assert.equal(writes.length, 1));
++  assert.deepEqual(writes[0].settings, { name: "after", retries: 3, enabled: false, mode: "fast", token: "" });
++  assert.equal(writes[0].validateOnly, true);
++  assert.ok(await screen.findByText("Settings are valid."));
++
++  await user.click(screen.getByRole("button", { name: "Save settings" }));
++  await waitFor(() => assert.equal(writes.length, 2));
++  assert.equal(writes[1].validateOnly, false);
++  assert.equal(writes[1].settings.token, "");
++  assert.ok(await screen.findByText("Settings saved."));
++  assert.equal(screen.getByLabelText("token").value, "");
++  assert.ok(document.querySelector("time"));
++});
++
++test("secret clearing is explicit and action requests contain only its declared id", async (t) => {
++  let current = config();
++  const requests = [];
++  t.mock.method(globalThis, "fetch", async (_url, init) => {
++    const method = init?.method ?? "GET";
++    if (method === "GET") return Response.json(current);
++    const body = JSON.parse(init.body);
++    requests.push({ method, body });
++    if (method === "DELETE") {
++      current = { ...current, settings: { ...current.settings, token: { configured: false, redacted: true } } };
++      return Response.json({ valid: true, errors: [], config: current });
++    }
++    if (method === "POST") return Response.json({ actionId: body.actionId, result: { source: "installed-plugin", reachable: true }, completedAt: "2026-11-22T12:00:00.000Z" });
++    throw new Error(`Unexpected ${method}`);
++  });
++
++  render(createElement(PluginSettingsForm, { pkg, cwd }));
++  const user = userEvent.setup();
++  await user.click(await screen.findByRole("button", { name: "Clear secret token" }));
++  await waitFor(() => assert.equal(requests.length, 1));
++  assert.deepEqual(requests[0], {
++    method: "DELETE",
++    body: { source: pkg.source, scope: pkg.scope, cwd, settings: {}, clearSecrets: ["token"] },
++  });
++  assert.ok(await screen.findByText("Secret token cleared."));
++
++  await user.click(screen.getByRole("button", { name: "Run check" }));
++  await waitFor(() => assert.equal(requests.length, 2));
++  assert.deepEqual(requests[1], { method: "POST", body: { source: pkg.source, scope: pkg.scope, cwd, actionId: "check" } });
++  assert.ok(await screen.findByText(/installed-plugin/));
++  assert.ok(screen.getByText("Action completed."));
++});
++
++test("a failed structured action result is rendered as an error, not success", async (t) => {
++  t.mock.method(globalThis, "fetch", async (_url, init) => {
++    if (!init?.method) return Response.json(config());
++    return Response.json({
++      actionId: "check",
++      result: { status: "failed", lastError: { code: "backend_protocol_error", message: "Native temporal evidence missing" } },
++      completedAt: "2026-11-22T12:00:00.000Z",
++    });
++  });
++  render(createElement(PluginSettingsForm, { pkg, cwd }));
++  const user = userEvent.setup();
++  await user.click(await screen.findByRole("button", { name: "Run check" }));
++  const alert = await screen.findByRole("alert");
++  assert.match(alert.textContent, /Native temporal evidence missing/);
++  assert.equal(screen.queryByText("Action completed."), null);
++});
++
++test("server-side manifest validation errors are visible without writing secrets into the DOM", async (t) => {
++  t.mock.method(globalThis, "fetch", async (_url, init) => {
++    if (!init?.method) return Response.json(config());
++    return Response.json({ valid: false, errors: [{ key: "retries", message: "Must be <= 3" }] }, { status: 400 });
++  });
++  render(createElement(PluginSettingsForm, { pkg, cwd }));
++  const user = userEvent.setup();
++  await user.click(await screen.findByRole("button", { name: "Save settings" }));
++  assert.ok(await screen.findByRole("alert"));
++  assert.match(screen.getByRole("alert").textContent, /retries: Must be <= 3/);
++});
+diff --git a/components/PluginSettingsForm.tsx b/components/PluginSettingsForm.tsx
+new file mode 100644
+index 0000000..2cd3a5b
+--- /dev/null
++++ b/components/PluginSettingsForm.tsx
+@@ -0,0 +1,364 @@
++"use client";
++
++import { useCallback, useEffect, useState } from "react";
++import { formatApiError } from "@/lib/i18n/api-error";
++import { useI18n } from "@/lib/i18n";
++import type {
++  PluginActionResponse,
++  PluginConfigResponse,
++  PluginConfigValidationError,
++  PluginConfigWriteResponse,
++  PluginPackageInfo,
++  PluginSecretState,
++  PluginSettingSchema,
++  PluginSettingValue,
++} from "@/lib/api-types";
++
++interface ActionState {
++  status: "success" | "error";
++  message: string;
++  result?: unknown;
++  at: string;
++}
++
++type DraftValue = string | boolean;
++type Drafts = Record<string, DraftValue>;
++
++function isSecretState(value: PluginSettingValue | PluginSecretState | undefined): value is PluginSecretState {
++  return typeof value === "object" && value !== null && value.redacted === true;
++}
++
++function draftsFromConfig(config: PluginConfigResponse): Drafts {
++  const drafts = Object.create(null) as Drafts;
++  for (const [key, schema] of Object.entries(config.schema)) {
++    if (schema.secret) {
++      drafts[key] = "";
++      continue;
++    }
++    const value = config.settings[key];
++    if (schema.type === "boolean") drafts[key] = typeof value === "boolean" ? value : false;
++    else if (schema.type === "enum") drafts[key] = typeof value === "string" ? value : (schema.values[0] ?? "");
++    else drafts[key] = typeof value === "string" || typeof value === "number" ? String(value) : "";
++  }
++  return drafts;
++}
++
++function targetParams(pkg: PluginPackageInfo, cwd: string | null): URLSearchParams {
++  const params = new URLSearchParams({ source: pkg.source, scope: pkg.scope });
++  if (cwd) params.set("cwd", cwd);
++  return params;
++}
++
++function fieldErrors(data: { errors?: PluginConfigValidationError[] }): string | null {
++  return data.errors?.length ? data.errors.map((error) => `${error.key}: ${error.message}`).join("\n") : null;
++}
++
++function ScalarInput({
++  settingKey,
++  schema,
++  value,
++  secretState,
++  disabled,
++  onChange,
++}: {
++  settingKey: string;
++  schema: PluginSettingSchema;
++  value: DraftValue;
++  secretState?: PluginSecretState;
++  disabled: boolean;
++  onChange: (value: DraftValue) => void;
++}) {
++  const { t } = useI18n();
++  const common = {
++    id: `plugin-setting-${settingKey}`,
++    "aria-label": settingKey,
++    disabled,
++  };
++  const style: React.CSSProperties = {
++    width: "100%",
++    minHeight: 34,
++    padding: "6px 9px",
++    border: "1px solid var(--border)",
++    borderRadius: 6,
++    background: "var(--bg-panel)",
++    color: "var(--text)",
++    fontFamily: schema.type === "string" || schema.secret ? "var(--font-mono)" : undefined,
++    fontSize: 12,
++  };
++
++  if (schema.secret) {
++    return (
++      <input
++        {...common}
++        type="password"
++        value={String(value)}
++        autoComplete="off"
++        placeholder={secretState?.configured ? t("pluginsConfig.secretKeep") : t("pluginsConfig.secretNotConfigured")}
++        onChange={(event) => onChange(event.target.value)}
++        style={style}
++      />
++    );
++  }
++  if (schema.type === "boolean") {
++    return (
++      <input
++        {...common}
++        type="checkbox"
++        checked={value === true}
++        onChange={(event) => onChange(event.target.checked)}
++        style={{ width: 18, height: 18, accentColor: "var(--accent-strong)" }}
++      />
++    );
++  }
++  if (schema.type === "enum") {
++    return (
++      <select {...common} value={String(value)} onChange={(event) => onChange(event.target.value)} style={style}>
++        {schema.values.map((option) => <option key={option} value={option}>{option}</option>)}
++      </select>
++    );
++  }
++  if (schema.type === "number") {
++    return (
++      <input
++        {...common}
++        type="number"
++        value={String(value)}
++        min={schema.min}
++        max={schema.max}
++        step={schema.step}
++        onChange={(event) => onChange(event.target.value)}
++        style={style}
++      />
++    );
++  }
++  return <input {...common} type="text" value={String(value)} onChange={(event) => onChange(event.target.value)} style={style} />;
++}
++
++/** Manifest-driven control plane only. All values, validation, secret handling
++ * and actions remain generic and are executed by the server/installed plugin. */
++export function PluginSettingsForm({ pkg, cwd }: { pkg: PluginPackageInfo; cwd: string | null }) {
++  const { t } = useI18n();
++  const [config, setConfig] = useState<PluginConfigResponse | null>(null);
++  const [drafts, setDrafts] = useState<Drafts>({});
++  const [loading, setLoading] = useState(true);
++  const [busy, setBusy] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [message, setMessage] = useState<string | null>(null);
++  const [completedAt, setCompletedAt] = useState<string | null>(null);
++  const [actionStates, setActionStates] = useState<Record<string, ActionState>>({});
++
++  const applyConfig = useCallback((next: PluginConfigResponse) => {
++    setConfig(next);
++    setDrafts(draftsFromConfig(next));
++  }, []);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(null);
++    try {
++      const response = await fetch(`/api/plugin-config?${targetParams(pkg, cwd)}`);
++      const data = await response.json() as PluginConfigResponse & { error?: string; code?: string };
++      if (!response.ok || data.error) throw new Error(formatApiError(data.error ? data : `HTTP ${response.status}`));
++      applyConfig(data);
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : String(cause));
++    } finally {
++      setLoading(false);
++    }
++  }, [applyConfig, cwd, pkg]);
++
++  useEffect(() => { void load(); }, [load]);
++
++  const valuesFromDrafts = useCallback((): Record<string, unknown> => {
++    if (!config) return {};
++    return Object.fromEntries(Object.entries(config.schema).map(([key, schema]) => {
++      const value = drafts[key];
++      if (!schema.secret && schema.type === "number") return [key, String(value).trim() === "" ? null : Number(value)];
++      return [key, value ?? ""];
++    }));
++  }, [config, drafts]);
++
++  const saveOrValidate = useCallback(async (validateOnly: boolean) => {
++    if (!config) return;
++    setBusy(validateOnly ? "validate" : "save");
++    setError(null);
++    setMessage(null);
++    try {
++      const response = await fetch("/api/plugin-config", {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          source: pkg.source,
++          scope: pkg.scope,
++          cwd,
++          settings: valuesFromDrafts(),
++          clearSecrets: [],
++          validateOnly,
++        }),
++      });
++      const data = await response.json() as Partial<PluginConfigWriteResponse> & { error?: string; code?: string };
++      if (!response.ok || data.error || data.valid === false) {
++        throw new Error(fieldErrors(data) ?? formatApiError(data.error ? data : `HTTP ${response.status}`));
++      }
++      if (data.config) applyConfig(data.config);
++      setMessage(t(validateOnly ? "pluginsConfig.settingsValid" : "pluginsConfig.settingsSaved"));
++      setCompletedAt(new Date().toISOString());
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : String(cause));
++      setCompletedAt(new Date().toISOString());
++    } finally {
++      setBusy(null);
++    }
++  }, [applyConfig, config, cwd, pkg.source, pkg.scope, t, valuesFromDrafts]);
++
++  const clearSecret = useCallback(async (key: string) => {
++    setBusy(`clear:${key}`);
++    setError(null);
++    setMessage(null);
++    try {
++      const response = await fetch("/api/plugin-config", {
++        method: "DELETE",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ source: pkg.source, scope: pkg.scope, cwd, settings: {}, clearSecrets: [key] }),
++      });
++      const data = await response.json() as Partial<PluginConfigWriteResponse> & { error?: string; code?: string };
++      if (!response.ok || data.error || !data.config) throw new Error(fieldErrors(data) ?? formatApiError(data.error ? data : `HTTP ${response.status}`));
++      applyConfig(data.config);
++      setMessage(t("pluginsConfig.secretCleared", { key }));
++      setCompletedAt(new Date().toISOString());
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : String(cause));
++      setCompletedAt(new Date().toISOString());
++    } finally {
++      setBusy(null);
++    }
++  }, [applyConfig, cwd, pkg.source, pkg.scope, t]);
++
++  const runAction = useCallback(async (actionId: string) => {
++    setBusy(`action:${actionId}`);
++    setError(null);
++    try {
++      const response = await fetch("/api/plugin-config", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ source: pkg.source, scope: pkg.scope, cwd, actionId }),
++      });
++      const data = await response.json() as Partial<PluginActionResponse> & { error?: string; code?: string };
++      const at = data.completedAt ?? new Date().toISOString();
++      if (!response.ok || data.error) {
++        const actionError = formatApiError(data.error ? data : `HTTP ${response.status}`);
++        setActionStates((current) => ({ ...current, [actionId]: { status: "error", message: actionError, at } }));
++      } else {
++        const result = data.result;
++        const failed = typeof result === "object" && result !== null && "status" in result && result.status === "failed";
++        let lastErrorMessage: string | undefined;
++        if (failed && "lastError" in result) {
++          const lastError: unknown = result.lastError;
++          if (typeof lastError === "object" && lastError !== null && "message" in lastError && typeof lastError.message === "string") {
++            lastErrorMessage = lastError.message;
++          }
++        }
++        const message = failed
++          ? (lastErrorMessage ?? t("pluginsConfig.actionErrorTitle", { action: actionId }))
++          : t("pluginsConfig.actionCompleted");
++        setActionStates((current) => ({ ...current, [actionId]: { status: failed ? "error" : "success", message, result, at } }));
++      }
++    } catch (cause) {
++      setActionStates((current) => ({ ...current, [actionId]: { status: "error", message: cause instanceof Error ? cause.message : String(cause), at: new Date().toISOString() } }));
++    } finally {
++      setBusy(null);
++    }
++  }, [cwd, pkg.source, pkg.scope, t]);
++
++  if (!pkg.settings || Object.keys(pkg.settings).length === 0) {
++    if (!pkg.actions || Object.keys(pkg.actions).length === 0) return null;
++  }
++  if (loading) return <div role="status" style={{ fontSize: 12, color: "var(--text-dim)" }}>{t("pluginsConfig.loadingSettings")}</div>;
++  if (!config) {
++    return (
++      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
++        <div role="alert" style={{ fontSize: 12, color: "var(--status-error)" }}>{error}</div>
++        <button type="button" onClick={() => void load()}>{t("pluginsConfig.retrySettings")}</button>
++      </div>
++    );
++  }
++
++  const disabled = busy !== null;
++  return (
++    <section aria-label={t("pluginsConfig.configuration")} style={{ display: "flex", flexDirection: "column", gap: 16, borderTop: "1px solid var(--border)", paddingTop: 18 }}>
++      <div>
++        <h3 style={{ margin: 0, fontSize: 13, color: "var(--text)" }}>{t("pluginsConfig.configuration")}</h3>
++        <p style={{ margin: "4px 0 0", fontSize: 11, lineHeight: 1.5, color: "var(--text-dim)" }}>{t("pluginsConfig.configurationHelp")}</p>
++      </div>
++
++      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
++        {Object.entries(config.schema).map(([key, schema]) => {
++          const value = config.settings[key];
++          const secretState = isSecretState(value) ? value : undefined;
++          return (
++            <div key={key} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
++              <label htmlFor={`plugin-setting-${key}`} style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>{key}</label>
++              {schema.description && <div style={{ fontSize: 11, lineHeight: 1.45, color: "var(--text-dim)" }}>{schema.description}</div>}
++              <ScalarInput
++                settingKey={key}
++                schema={schema}
++                value={drafts[key] ?? (schema.type === "boolean" ? false : "")}
++                secretState={secretState}
++                disabled={disabled}
++                onChange={(next) => setDrafts((current) => ({ ...current, [key]: next }))}
++              />
++              {secretState && (
++                <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 11, color: "var(--text-dim)" }}>
++                  <span>{secretState.configured ? t("pluginsConfig.secretConfigured") : t("pluginsConfig.secretNotConfigured")}</span>
++                  <button
++                    type="button"
++                    aria-label={t("pluginsConfig.clearSecret", { key })}
++                    disabled={disabled || !secretState.configured}
++                    onClick={() => void clearSecret(key)}
++                    style={{ border: "none", background: "none", padding: 0, color: "var(--status-error)", cursor: disabled ? "not-allowed" : "pointer", opacity: secretState.configured ? 1 : 0.5 }}
++                  >
++                    {busy === `clear:${key}` ? t("pluginsConfig.clearing") : t("pluginsConfig.clear")}
++                  </button>
++                </div>
++              )}
++            </div>
++          );
++        })}
++      </div>
++
++      {Object.keys(config.schema).length > 0 && (
++        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
++          <button type="button" disabled={disabled} onClick={() => void saveOrValidate(false)}>{busy === "save" ? t("pluginsConfig.saving") : t("pluginsConfig.saveSettings")}</button>
++          <button type="button" disabled={disabled} onClick={() => void saveOrValidate(true)}>{busy === "validate" ? t("pluginsConfig.validating") : t("pluginsConfig.validateSettings")}</button>
++        </div>
++      )}
++
++      {message && <div role="status" style={{ fontSize: 12, color: "var(--status-success)" }}>{message}</div>}
++      {error && <div role="alert" style={{ fontSize: 12, color: "var(--status-error)", whiteSpace: "pre-wrap" }}>{error}</div>}
++      {completedAt && <time dateTime={completedAt} style={{ fontSize: 10, color: "var(--text-dim)" }}>{new Date(completedAt).toLocaleString()}</time>}
++
++      {Object.keys(config.actions).length > 0 && (
++        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
++          <h4 style={{ margin: 0, fontSize: 12, color: "var(--text-muted)" }}>{t("pluginsConfig.declaredActions")}</h4>
++          {Object.entries(config.actions).map(([actionId, action]) => {
++            const state = Object.hasOwn(actionStates, actionId) ? actionStates[actionId] : undefined;
++            return (
++              <div key={actionId} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 10, display: "flex", flexDirection: "column", gap: 7 }}>
++                <div style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--text)" }}>{actionId}</div>
++                {action.description && <div style={{ fontSize: 11, color: "var(--text-dim)" }}>{action.description}</div>}
++                <div><button type="button" disabled={disabled} onClick={() => void runAction(actionId)}>{busy === `action:${actionId}` ? t("pluginsConfig.runningAction") : t("pluginsConfig.runAction", { action: actionId })}</button></div>
++                {state && (
++                  <div role={state.status === "error" ? "alert" : "status"} style={{ fontSize: 11, color: state.status === "error" ? "var(--status-error)" : "var(--status-success)" }}>
++                    <div>{state.message}</div>
++                    <time dateTime={state.at} style={{ color: "var(--text-dim)" }}>{new Date(state.at).toLocaleString()}</time>
++                    {state.result !== undefined && <pre style={{ maxHeight: 220, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", color: "var(--text-muted)", background: "var(--bg-panel)", padding: 8 }}>{JSON.stringify(state.result, null, 2)}</pre>}
++                  </div>
++                )}
++              </div>
++            );
++          })}
++        </div>
++      )}
++    </section>
++  );
++}
+diff --git a/components/PluginsConfig.tsx b/components/PluginsConfig.tsx
+index 7585a86..fd1b89f 100644
+--- a/components/PluginsConfig.tsx
++++ b/components/PluginsConfig.tsx
+@@ -13,6 +13,7 @@ import { ConfirmDialog } from "@/components/ui/field";
+ import { toast } from "@/components/ui/toast";
+ import { Plus } from "lucide-react";
+ import { SettingsTabs, type SettingsTab } from "./SettingsTabs";
++import { PluginSettingsForm } from "./PluginSettingsForm";
+ import type { PluginPackageInfo, PluginsResponse } from "@/lib/api-types";
+ 
+ function PluginsConfigSurface({ embedded, isMobile, onClose, children }: { embedded: boolean; isMobile: boolean; onClose: () => void; children: React.ReactNode }) {
+@@ -586,6 +587,8 @@ function PackageDetail({
+         <ResourceList pkg={pkg} />
+       </div>
+ 
++      <PluginSettingsForm pkg={pkg} cwd={cwd} />
++
+       {actionMessage && (
+         <div style={{ fontSize: 12, color: "var(--status-success)" }}>
+           {actionMessage}
+diff --git a/components/SettingsConfig.cluster.test.mjs b/components/SettingsConfig.cluster.test.mjs
+index 57e417e..4301243 100644
+--- a/components/SettingsConfig.cluster.test.mjs
++++ b/components/SettingsConfig.cluster.test.mjs
+@@ -161,6 +161,20 @@ test("the system tab shows the notice next to the agent environment variables, w
+   assert.equal(screen.queryByText(NOTICE), null);
+ });
+ 
++test("Extensions & Tools opens the Plugins subpanel without normalizing it back to MCP", async (t) => {
++  recordRequests(t);
++  const selections = [];
++  const view = render(createElement(SettingsConfig, { ...settingsProps, activeTab: "mcp", onSelectTab: (tab) => selections.push(tab) }));
++  const user = userEvent.setup();
++  await user.click(await screen.findByRole("button", { name: "Plugins" }));
++  assert.deepEqual(selections, ["plugins"]);
++
++  view.rerender(createElement(SettingsConfig, { ...settingsProps, activeTab: "plugins", onSelectTab: (tab) => selections.push(tab) }));
++  assert.ok(await screen.findByText("No plugins configured"));
++  assert.equal(document.getElementById("settings-panel-plugins")?.getAttribute("aria-labelledby"), "settings-tab-mcp");
++  assert.equal(screen.getByRole("tab", { name: /Extensions & Tools/ }).getAttribute("aria-selected"), "true");
++});
++
+ test("without a workspace the Plugins panel works at the user level: no cwd, global installs only", async (t) => {
+   const requests = recordRequests(t);
+   render(createElement(PluginsConfig, { embedded: true, cwd: null, sessionId: null, onClose: noop }));
+diff --git a/components/SettingsConfig.tsx b/components/SettingsConfig.tsx
+index 04af234..dae2649 100644
+--- a/components/SettingsConfig.tsx
++++ b/components/SettingsConfig.tsx
+@@ -1193,7 +1193,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
+     }
+   }, [appUpdatesDisabled, onRefreshAppUpdate]);
+ 
+-  const currentTab = activeTab === "skills" ? activeTab : getNormalizedActive(activeTab);
++  const currentTab = activeTab === "skills" || activeTab === "plugins" ? activeTab : getNormalizedActive(activeTab);
+   const nativeSettingsRequired = currentTab === "general" || currentTab === "safety" || currentTab === "models" || currentTab === "intelligence" || currentTab === "mcp";
+   useEffect(() => {
+     if (currentTab === "system") {
+@@ -1850,7 +1850,12 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
+                 <div style={{ marginBottom: 4 }}>
+                   <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.extensionsTools")}</h2>
+                   <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.extensionsToolsDesc")}</p>
+-                  {cwd && (!remoteHost || cluster) && <button type="button" className="settings-back ui-focus-ring" onClick={() => handleSelectTab("skills")}>{t("skillsConfig.title")}</button>}
++                  {cwd && (!remoteHost || cluster) && (
++                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
++                      <button type="button" className="settings-back ui-focus-ring" onClick={() => handleSelectTab("skills")}>{t("skillsConfig.title")}</button>
++                      <button type="button" className="settings-back ui-focus-ring" onClick={() => handleSelectTab("plugins")}>{t("pluginsConfig.title")}</button>
++                    </div>
++                  )}
+                 </div>
+                 {cwd && (!remoteHost || cluster) && (
+                   <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+@@ -1888,7 +1893,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
+ 
+             {/* PLUGINS SUB-PANEL CONTRACT MATCH */}
+             {cwd && currentTab === "plugins" && (
+-              <div role="tabpanel" id="settings-panel-plugins" aria-labelledby="settings-tab-plugins" className="settings-panel-inner" style={{ display: currentTab === "plugins" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: isMobile ? undefined : 600, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
++              <div role="tabpanel" id="settings-panel-plugins" aria-labelledby="settings-tab-mcp" className="settings-panel-inner" style={{ display: currentTab === "plugins" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: isMobile ? undefined : 600, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
+                 {panelsUnavailable ? remoteUnavailable : <PluginsConfig embedded cwd={panelCwd} sessionId={panelSessionId} onClose={onClose} onReloaded={onPluginsReloaded} />}
+               </div>
+             )}
+diff --git a/lib/api-types.ts b/lib/api-types.ts
+index b0add3d..099c0e3 100644
+--- a/lib/api-types.ts
++++ b/lib/api-types.ts
+@@ -52,6 +52,58 @@ export interface SkillInfo {
+ export type PluginScope = "global" | "project";
+ export type PluginResourceKind = "extension" | "skill" | "prompt" | "theme";
+ 
++interface PluginSettingBase {
++  description?: string;
++  secret?: boolean;
++  env?: string;
++}
++
++export type PluginSettingSchema =
++  | (PluginSettingBase & { type: "string"; default?: string })
++  | (PluginSettingBase & { type: "number"; default?: number; min?: number; max?: number; step?: number })
++  | (PluginSettingBase & { type: "boolean"; default?: boolean })
++  | (PluginSettingBase & { type: "enum"; values: string[]; default?: string });
++
++export interface PluginActionInfo {
++  description?: string;
++}
++
++export type PluginSettingValue = string | number | boolean;
++export interface PluginSecretState {
++  configured: boolean;
++  redacted: true;
++}
++
++export interface PluginConfigResponse {
++  source: string;
++  scope: PluginScope;
++  schema: Record<string, PluginSettingSchema>;
++  settings: Record<string, PluginSettingValue | PluginSecretState>;
++  actions: Record<string, PluginActionInfo>;
++}
++
++export interface PluginConfigListResponse {
++  plugins: Array<Pick<PluginConfigResponse, "source" | "scope" | "schema" | "actions">>;
++}
++
++export interface PluginConfigValidationError {
++  key: string;
++  code: "unknown_setting" | "invalid_setting" | "not_a_secret";
++  message: string;
++}
++
++export interface PluginConfigWriteResponse {
++  valid: boolean;
++  errors: PluginConfigValidationError[];
++  config?: PluginConfigResponse;
++}
++
++export interface PluginActionResponse {
++  actionId: string;
++  result: unknown;
++  completedAt: string;
++}
++
+ export interface PluginResourceCounts {
+   extensions: number;
+   skills: number;
+@@ -82,6 +134,8 @@ export interface PluginPackageInfo {
+   packageName?: string;
+   version?: string;
+   configuredVersion?: string;
++  settings?: Record<string, PluginSettingSchema>;
++  actions?: Record<string, PluginActionInfo>;
+   counts: PluginResourceCounts;
+   resources: PluginResourceInfo[];
+   status: "loaded" | "installed" | "missing" | "disabled";
+diff --git a/lib/i18n/locales/en.json b/lib/i18n/locales/en.json
+index 7013dc2..0b1cdbd 100644
+--- a/lib/i18n/locales/en.json
++++ b/lib/i18n/locales/en.json
+@@ -1129,16 +1129,23 @@
+   "pluginsConfig.action_update": "update",
+   "pluginsConfig.action_disable": "disable",
+   "pluginsConfig.action_enable": "enable",
++  "pluginsConfig.actionCompleted": "Action completed.",
+   "pluginsConfig.addPlugin": "Add plugin",
+   "pluginsConfig.addPluginTitle": "Add plugin",
+   "pluginsConfig.badgeDisabled": "disabled",
+   "pluginsConfig.badgeFiltered": "filtered",
+   "pluginsConfig.cancel": "Cancel",
++  "pluginsConfig.clear": "Clear",
++  "pluginsConfig.clearSecret": "Clear secret {key}",
++  "pluginsConfig.clearing": "Clearing…",
+   "pluginsConfig.close": "Close",
++  "pluginsConfig.configuration": "Plugin configuration",
++  "pluginsConfig.configurationHelp": "Settings are validated and saved by OMP. Secret values are write-only; leave one blank to keep it.",
+   "pluginsConfig.configuredVersion": "configured {version}",
+   "pluginsConfig.cwd": "Cwd",
+   "pluginsConfig.diagnosticCount.one": "{count} diagnostic",
+   "pluginsConfig.diagnosticCount.other": "{count} diagnostics",
++  "pluginsConfig.declaredActions": "Declared actions",
+   "pluginsConfig.disablePackage": "Disable package",
+   "pluginsConfig.disabled": "Disabled",
+   "pluginsConfig.enablePackage": "Enable package",
+@@ -1151,6 +1158,7 @@
+   "pluginsConfig.installedVersion": "installed {version}",
+   "pluginsConfig.installing": "Installing...",
+   "pluginsConfig.loading": "Loading...",
++  "pluginsConfig.loadingSettings": "Loading plugin settings…",
+   "pluginsConfig.noPlugins": "No plugins configured",
+   "pluginsConfig.noResolvedResources": "No resolved resources",
+   "pluginsConfig.noResources": "No resources",
+@@ -1176,10 +1184,21 @@
+   "pluginsConfig.removing": "Removing...",
+   "pluginsConfig.resolvedResources": "Resolved Resources",
+   "pluginsConfig.resources": "Resources",
++  "pluginsConfig.retrySettings": "Retry loading settings",
++  "pluginsConfig.runAction": "Run {action}",
++  "pluginsConfig.runningAction": "Running…",
++  "pluginsConfig.saveSettings": "Save settings",
++  "pluginsConfig.saving": "Saving…",
+   "pluginsConfig.scopeGlobal": "global",
+   "pluginsConfig.scopeProject": "project",
++  "pluginsConfig.secretCleared": "Secret {key} cleared.",
++  "pluginsConfig.secretConfigured": "Configured · redacted",
++  "pluginsConfig.secretKeep": "Configured — leave blank to keep",
++  "pluginsConfig.secretNotConfigured": "Not configured",
+   "pluginsConfig.selectPackage": "Select a package",
+   "pluginsConfig.sessionReloaded": "Session reloaded.",
++  "pluginsConfig.settingsSaved": "Settings saved.",
++  "pluginsConfig.settingsValid": "Settings are valid.",
+   "pluginsConfig.skillCount.one": "{count} skill",
+   "pluginsConfig.skillCount.other": "{count} skills",
+   "pluginsConfig.skills": "Skills",
+@@ -1197,6 +1216,8 @@
+   "pluginsConfig.unknown": "Unknown",
+   "pluginsConfig.update": "Update",
+   "pluginsConfig.updating": "Updating...",
++  "pluginsConfig.validateSettings": "Validate settings",
++  "pluginsConfig.validating": "Validating…",
+   "pluginsConfig.version": "Version",
+   "projects.activity": "{running} running, {unread} unread, {exited} exited unexpectedly",
+   "projects.add": "Add workspace",
+diff --git a/lib/i18n/locales/ja.json b/lib/i18n/locales/ja.json
+index 93da3ed..ec0c6dc 100644
+--- a/lib/i18n/locales/ja.json
++++ b/lib/i18n/locales/ja.json
+@@ -1090,12 +1090,18 @@
+   "pluginsConfig.action_update": "更新",
+   "pluginsConfig.action_disable": "無効化",
+   "pluginsConfig.action_enable": "有効化",
++  "pluginsConfig.actionCompleted": "アクションが完了しました。",
+   "pluginsConfig.addPlugin": "プラグインを追加",
+   "pluginsConfig.addPluginTitle": "プラグインを追加",
+   "pluginsConfig.badgeDisabled": "無効",
+   "pluginsConfig.badgeFiltered": "フィルタ済み",
+   "pluginsConfig.cancel": "キャンセル",
++  "pluginsConfig.clear": "クリア",
++  "pluginsConfig.clearSecret": "シークレット {key} をクリア",
++  "pluginsConfig.clearing": "クリア中…",
+   "pluginsConfig.close": "閉じる",
++  "pluginsConfig.configuration": "プラグイン設定",
++  "pluginsConfig.configurationHelp": "設定は OMP が検証して保存します。シークレットは書き込み専用で、空のまま保存すると保持されます。",
+   "pluginsConfig.configuredVersion": "設定 {version}",
+   "pluginsConfig.cwd": "Cwd",
+   "pluginsConfig.diagnosticCount.one": "{count} 件の診断",
+@@ -1158,6 +1164,21 @@
+   "pluginsConfig.unknown": "不明",
+   "pluginsConfig.update": "更新",
+   "pluginsConfig.updating": "更新中...",
++  "pluginsConfig.declaredActions": "宣言されたアクション",
++  "pluginsConfig.loadingSettings": "プラグイン設定を読み込み中…",
++  "pluginsConfig.retrySettings": "設定を再読み込み",
++  "pluginsConfig.runAction": "{action} を実行",
++  "pluginsConfig.runningAction": "実行中…",
++  "pluginsConfig.saveSettings": "設定を保存",
++  "pluginsConfig.saving": "保存中…",
++  "pluginsConfig.secretCleared": "シークレット {key} をクリアしました。",
++  "pluginsConfig.secretConfigured": "設定済み · マスク済み",
++  "pluginsConfig.secretKeep": "設定済み — 空のまま保持",
++  "pluginsConfig.secretNotConfigured": "未設定",
++  "pluginsConfig.settingsSaved": "設定を保存しました。",
++  "pluginsConfig.settingsValid": "設定は有効です。",
++  "pluginsConfig.validateSettings": "設定を検証",
++  "pluginsConfig.validating": "検証中…",
+   "pluginsConfig.version": "バージョン",
+   "projects.activity": "{running} 実行中、{unread} 未読、{exited} 異常終了",
+   "projects.add": "ワークスペースを追加",
+diff --git a/lib/i18n/locales/zh-CN.json b/lib/i18n/locales/zh-CN.json
+index cf8d7e4..f31338c 100644
+--- a/lib/i18n/locales/zh-CN.json
++++ b/lib/i18n/locales/zh-CN.json
+@@ -1090,12 +1090,18 @@
+   "pluginsConfig.action_update": "更新",
+   "pluginsConfig.action_disable": "禁用",
+   "pluginsConfig.action_enable": "启用",
++  "pluginsConfig.actionCompleted": "操作已完成。",
+   "pluginsConfig.addPlugin": "添加插件",
+   "pluginsConfig.addPluginTitle": "添加插件",
+   "pluginsConfig.badgeDisabled": "已禁用",
+   "pluginsConfig.badgeFiltered": "已过滤",
+   "pluginsConfig.cancel": "取消",
++  "pluginsConfig.clear": "清除",
++  "pluginsConfig.clearSecret": "清除密钥 {key}",
++  "pluginsConfig.clearing": "正在清除…",
+   "pluginsConfig.close": "关闭",
++  "pluginsConfig.configuration": "插件配置",
++  "pluginsConfig.configurationHelp": "设置由 OMP 校验并保存。密钥只写不读；留空会保留原值。",
+   "pluginsConfig.configuredVersion": "已配置 {version}",
+   "pluginsConfig.cwd": "Cwd",
+   "pluginsConfig.diagnosticCount.one": "{count} 条诊断",
+@@ -1158,6 +1164,21 @@
+   "pluginsConfig.unknown": "未知",
+   "pluginsConfig.update": "更新",
+   "pluginsConfig.updating": "更新中...",
++  "pluginsConfig.declaredActions": "已声明的操作",
++  "pluginsConfig.loadingSettings": "正在加载插件设置…",
++  "pluginsConfig.retrySettings": "重新加载设置",
++  "pluginsConfig.runAction": "运行 {action}",
++  "pluginsConfig.runningAction": "正在运行…",
++  "pluginsConfig.saveSettings": "保存设置",
++  "pluginsConfig.saving": "正在保存…",
++  "pluginsConfig.secretCleared": "密钥 {key} 已清除。",
++  "pluginsConfig.secretConfigured": "已配置 · 已脱敏",
++  "pluginsConfig.secretKeep": "已配置——留空以保留",
++  "pluginsConfig.secretNotConfigured": "未配置",
++  "pluginsConfig.settingsSaved": "设置已保存。",
++  "pluginsConfig.settingsValid": "设置有效。",
++  "pluginsConfig.validateSettings": "校验设置",
++  "pluginsConfig.validating": "正在校验…",
+   "pluginsConfig.version": "版本",
+   "projects.activity": "{running} 个运行中，{unread} 个未读，{exited} 个异常退出",
+   "projects.add": "添加工作区",
+diff --git a/lib/i18n/locales/zh-TW.json b/lib/i18n/locales/zh-TW.json
+index 8ae164b..8f1c3c8 100644
+--- a/lib/i18n/locales/zh-TW.json
++++ b/lib/i18n/locales/zh-TW.json
+@@ -1128,12 +1128,18 @@
+   "pluginsConfig.action_update": "更新",
+   "pluginsConfig.action_disable": "停用",
+   "pluginsConfig.action_enable": "啟用",
++  "pluginsConfig.actionCompleted": "操作已完成。",
+   "pluginsConfig.addPlugin": "新增外掛程式",
+   "pluginsConfig.addPluginTitle": "新增外掛程式",
+   "pluginsConfig.badgeDisabled": "已停用",
+   "pluginsConfig.badgeFiltered": "已篩選",
+   "pluginsConfig.cancel": "取消",
++  "pluginsConfig.clear": "清除",
++  "pluginsConfig.clearSecret": "清除密鑰 {key}",
++  "pluginsConfig.clearing": "正在清除…",
+   "pluginsConfig.close": "關閉",
++  "pluginsConfig.configuration": "外掛程式設定",
++  "pluginsConfig.configurationHelp": "設定由 OMP 驗證並儲存。密鑰只寫不讀；留空會保留原值。",
+   "pluginsConfig.configuredVersion": "設定的版本 {version}",
+   "pluginsConfig.cwd": "工作目錄",
+   "pluginsConfig.diagnosticCount.one": "{count} 個診斷項目",
+@@ -1196,6 +1202,21 @@
+   "pluginsConfig.unknown": "未知",
+   "pluginsConfig.update": "更新",
+   "pluginsConfig.updating": "更新中...",
++  "pluginsConfig.declaredActions": "已宣告的操作",
++  "pluginsConfig.loadingSettings": "正在載入外掛程式設定…",
++  "pluginsConfig.retrySettings": "重新載入設定",
++  "pluginsConfig.runAction": "執行 {action}",
++  "pluginsConfig.runningAction": "正在執行…",
++  "pluginsConfig.saveSettings": "儲存設定",
++  "pluginsConfig.saving": "正在儲存…",
++  "pluginsConfig.secretCleared": "密鑰 {key} 已清除。",
++  "pluginsConfig.secretConfigured": "已設定 · 已遮罩",
++  "pluginsConfig.secretKeep": "已設定——留空以保留",
++  "pluginsConfig.secretNotConfigured": "未設定",
++  "pluginsConfig.settingsSaved": "設定已儲存。",
++  "pluginsConfig.settingsValid": "設定有效。",
++  "pluginsConfig.validateSettings": "驗證設定",
++  "pluginsConfig.validating": "正在驗證…",
+   "pluginsConfig.version": "版本",
+   "projects.activity": "{running} 個執行中，{unread} 個未讀，{exited} 個意外結束",
+   "projects.add": "新增工作區",
+diff --git a/lib/omp/plugin-config.test.mjs b/lib/omp/plugin-config.test.mjs
+new file mode 100644
+index 0000000..3ede758
+--- /dev/null
++++ b/lib/omp/plugin-config.test.mjs
+@@ -0,0 +1,94 @@
++import assert from "node:assert/strict";
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import test from "node:test";
++import {
++  MAX_PLUGIN_ACTION_RESPONSE_BYTES,
++  executePluginAction,
++  publicPluginActions,
++  publicPluginSchema,
++  publicPluginSettings,
++  serializePluginActionPayload,
++  serializePluginWrite,
++  validatePluginSettings,
++  validateSecretClears,
++} from "./plugin-config.ts";
++
++const schema = {
++  name: { type: "string", default: "demo" },
++  retries: { type: "number", min: 1, max: 3 },
++  enabled: { type: "boolean", default: true },
++  mode: { type: "enum", values: ["fast", "safe"] },
++  token: { type: "string", secret: true, default: "must-not-leak" },
++};
++
++test("all manifest scalar types use OMP-equivalent validation and reject unknown keys before writes", () => {
++  assert.deepEqual(validatePluginSettings(schema, { name: "ok", retries: 2, enabled: false, mode: "safe" }), []);
++  const errors = validatePluginSettings(schema, { name: 1, retries: 4, enabled: "true", mode: "other", extra: "x" });
++  assert.deepEqual(errors.map(({ key, code }) => ({ key, code })), [
++    { key: "name", code: "invalid_setting" },
++    { key: "retries", code: "invalid_setting" },
++    { key: "enabled", code: "invalid_setting" },
++    { key: "mode", code: "invalid_setting" },
++    { key: "extra", code: "unknown_setting" },
++  ]);
++  assert.deepEqual(validatePluginSettings(schema, { token: "" }, { preserveBlankSecrets: true }), []);
++  assert.deepEqual(validateSecretClears(schema, ["name", "missing"]).map((error) => error.code), ["not_a_secret", "unknown_setting"]);
++});
++
++test("public settings redact secrets and secret defaults while exposing ordinary defaults", () => {
++  const publicSchema = publicPluginSchema(schema);
++  assert.equal(Object.hasOwn(publicSchema.token, "default"), false);
++  assert.equal(publicSchema.name.default, "demo");
++  assert.deepEqual(publicPluginSettings(publicSchema, { retries: 2, token: "raw-secret" }), {
++    name: "demo",
++    retries: 2,
++    enabled: true,
++    token: { configured: true, redacted: true },
++  });
++  assert.deepEqual(publicPluginSettings(publicSchema, {}).token, { configured: false, redacted: true });
++  assert.deepEqual(publicPluginActions({ check: { module: "./private.ts", export: "run", description: "Check" } }), { check: { description: "Check" } });
++});
++
++test("writes for one scope are serial, including after a failure", async () => {
++  const events = [];
++  const operation = (name, fail = false) => serializePluginWrite("project", "/workspace", async () => {
++    events.push(`${name}:start`);
++    await new Promise((resolve) => setTimeout(resolve, name === "first" ? 15 : 1));
++    events.push(`${name}:end`);
++    if (fail) throw new Error("failure");
++  });
++  const first = operation("first", true);
++  const second = operation("second");
++  await assert.rejects(first, /failure/);
++  await second;
++  assert.deepEqual(events, ["first:start", "first:end", "second:start", "second:end"]);
++});
++
++test("a manifest action executes the installed module with cwd and signal, never a caller-selected module", async () => {
++  const parent = mkdtempSync(join(tmpdir(), "omp-web-plugin-action-"));
++  const root = join(parent, "package");
++  mkdirSync(root);
++  try {
++    writeFileSync(join(root, "action.mjs"), "export async function declared(cwd, signal) { return { source: 'installed-plugin', cwd, hasSignal: signal instanceof AbortSignal }; }\n");
++    const controller = new AbortController();
++    const result = await executePluginAction(root, { module: "./action.mjs", export: "declared" }, "/allowed/workspace", controller.signal);
++    assert.deepEqual(result, { source: "installed-plugin", cwd: "/allowed/workspace", hasSignal: true });
++
++    const parentAction = join(parent, "outside-action.mjs");
++    writeFileSync(parentAction, "export function declared() { return { forbidden: true }; }\n");
++    await assert.rejects(executePluginAction(root, { module: parentAction, export: "declared" }, "/allowed/workspace"), /outside the package root/);
++    rmSync(parentAction, { force: true });
++  } finally {
++    rmSync(parent, { recursive: true, force: true });
++  }
++});
++
++test("action results must be bounded JSON", () => {
++  const cyclic = {};
++  cyclic.self = cyclic;
++  assert.throws(() => serializePluginActionPayload(cyclic), /non-JSON/);
++  assert.throws(() => serializePluginActionPayload({ text: "x".repeat(MAX_PLUGIN_ACTION_RESPONSE_BYTES) }), /bounded JSON/);
++  assert.equal(serializePluginActionPayload({ ok: true }), '{"ok":true}');
++});
+diff --git a/lib/omp/plugin-config.ts b/lib/omp/plugin-config.ts
+new file mode 100644
+index 0000000..958bdbc
+--- /dev/null
++++ b/lib/omp/plugin-config.ts
+@@ -0,0 +1,165 @@
++import { realpath } from "node:fs/promises";
++import { isAbsolute, relative, resolve } from "node:path";
++import { pathToFileURL } from "node:url";
++import type {
++  PluginActionInfo,
++  PluginConfigValidationError,
++  PluginSecretState,
++  PluginSettingSchema,
++  PluginSettingValue,
++} from "@/lib/api-types";
++
++export const MAX_PLUGIN_ACTION_RESPONSE_BYTES = 256 * 1024;
++
++export interface OmpActionDeclaration {
++  module: string;
++  export: string;
++  description?: string;
++}
++
++/** Only schema is public. In particular, a secret's default is a value too and
++ * must not cross the server boundary. Action module/export names stay on the
++ * server: the browser needs only the declared id and description. */
++export function publicPluginSchema(schema: Record<string, PluginSettingSchema> | undefined): Record<string, PluginSettingSchema> {
++  return Object.fromEntries(Object.entries(schema ?? {}).map(([key, setting]) => {
++    const safe = { ...setting };
++    if (safe.secret) delete safe.default;
++    return [key, safe];
++  }));
++}
++
++export function publicPluginActions(actions: Record<string, OmpActionDeclaration> | undefined): Record<string, PluginActionInfo> {
++  return Object.fromEntries(Object.entries(actions ?? {}).map(([id, action]) => [id, { description: action.description }]));
++}
++
++/** Mirrors omp's validateSetting for the four manifest scalar types. Unknown
++ * request keys are rejected separately, before any CLI write is started. */
++export function validatePluginSettings(
++  schema: Record<string, PluginSettingSchema>,
++  values: Record<string, unknown>,
++  options: { preserveBlankSecrets?: boolean } = {},
++): PluginConfigValidationError[] {
++  const errors: PluginConfigValidationError[] = [];
++  for (const [key, value] of Object.entries(values)) {
++    const setting = Object.hasOwn(schema, key) ? schema[key] : undefined;
++    if (!setting) {
++      errors.push({ key, code: "unknown_setting", message: "Unknown setting" });
++      continue;
++    }
++    if (options.preserveBlankSecrets && setting.secret && value === "") continue;
++
++    let message: string | undefined;
++    switch (setting.type) {
++      case "string":
++        if (typeof value !== "string") message = "Expected string";
++        break;
++      case "number":
++        if (typeof value !== "number" || Number.isNaN(value)) message = "Expected number";
++        else if (setting.min !== undefined && value < setting.min) message = `Must be >= ${setting.min}`;
++        else if (setting.max !== undefined && value > setting.max) message = `Must be <= ${setting.max}`;
++        break;
++      case "boolean":
++        if (typeof value !== "boolean") message = "Expected boolean";
++        break;
++      case "enum":
++        if (!setting.values.includes(String(value))) message = `Must be one of: ${setting.values.join(", ")}`;
++        break;
++    }
++    if (message) errors.push({ key, code: "invalid_setting", message });
++  }
++  return errors;
++}
++
++export function validateSecretClears(
++  schema: Record<string, PluginSettingSchema>,
++  keys: string[],
++): PluginConfigValidationError[] {
++  const errors: PluginConfigValidationError[] = [];
++  for (const key of keys) {
++    const setting = Object.hasOwn(schema, key) ? schema[key] : undefined;
++    if (!setting) errors.push({ key, code: "unknown_setting", message: "Unknown setting" });
++    else if (!setting.secret) errors.push({ key, code: "not_a_secret", message: "Only secret settings can be cleared" });
++  }
++  return errors;
++}
++
++/** Raw values never leave this function for secret keys. Defaults are exposed
++ * only for non-secret settings, matching `omp plugin config list` display. */
++export function publicPluginSettings(
++  schema: Record<string, PluginSettingSchema>,
++  raw: Record<string, unknown>,
++): Record<string, PluginSettingValue | PluginSecretState> {
++  const entries: Array<[string, PluginSettingValue | PluginSecretState]> = [];
++  for (const [key, setting] of Object.entries(schema)) {
++    if (setting.secret) {
++      entries.push([key, {
++        configured: Object.hasOwn(raw, key) && raw[key] !== undefined && raw[key] !== null && raw[key] !== "",
++        redacted: true,
++      }]);
++      continue;
++    }
++    const value = Object.hasOwn(raw, key) ? raw[key] : setting.default;
++    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") entries.push([key, value]);
++  }
++  return Object.fromEntries(entries);
++}
++
++// A scope owns a runtime configuration file. Serializing by scope (rather than
++// by plugin) prevents two Web requests for different plugins from interleaving.
++// This is deliberately only the Web-side queue; omp's own lock remains the
++// authority for coordination with external CLI processes.
++const writeTails = new Map<string, Promise<void>>();
++
++export async function serializePluginWrite<T>(scope: "global" | "project", cwd: string | null, operation: () => Promise<T>): Promise<T> {
++  const key = scope === "global" ? "global" : `project:${cwd ?? ""}`;
++  const previous = writeTails.get(key) ?? Promise.resolve();
++  const run = previous.catch(() => {}).then(operation);
++  const tail = run.then(() => undefined, () => undefined);
++  writeTails.set(key, tail);
++  try {
++    return await run;
++  } finally {
++    if (writeTails.get(key) === tail) writeTails.delete(key);
++  }
++}
++
++function withinRoot(root: string, candidate: string): boolean {
++  const rel = relative(root, candidate);
++  return rel !== "" && rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !isAbsolute(rel);
++}
++
++/** Resolve and execute only an action declaration read from the installed
++ * package manifest. Neither the module nor the export is request-controlled. */
++export async function executePluginAction(
++  packageRoot: string,
++  declaration: OmpActionDeclaration,
++  cwd: string,
++  signal?: AbortSignal,
++): Promise<unknown> {
++  if (!declaration || typeof declaration.module !== "string" || !declaration.module || typeof declaration.export !== "string" || !declaration.export) {
++    throw new Error("Invalid plugin action declaration");
++  }
++  signal?.throwIfAborted();
++  const root = await realpath(packageRoot);
++  const modulePath = await realpath(resolve(root, declaration.module));
++  if (!withinRoot(root, modulePath)) throw new Error("Plugin action module is outside the package root");
++  // Runtime plugin registry: a static import cannot name an installed package's manifest-selected action module.
++  const loaded = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
++  const action = Object.hasOwn(loaded, declaration.export) ? loaded[declaration.export] : undefined;
++  if (typeof action !== "function") throw new Error("Plugin action export is not a function");
++  signal?.throwIfAborted();
++  return await (action as (cwd: string, signal?: AbortSignal) => unknown)(cwd, signal);
++}
++
++export function serializePluginActionPayload(payload: unknown): string {
++  let json: string | undefined;
++  try {
++    json = JSON.stringify(payload);
++  } catch {
++    throw new Error("Plugin action returned a non-JSON result");
++  }
++  if (json === undefined || Buffer.byteLength(json, "utf8") > MAX_PLUGIN_ACTION_RESPONSE_BYTES) {
++    throw new Error("Plugin action result is not bounded JSON");
++  }
++  return json;
++}
+diff --git a/lib/omp/plugin-management.ts b/lib/omp/plugin-management.ts
+new file mode 100644
+index 0000000..8220e7a
+--- /dev/null
++++ b/lib/omp/plugin-management.ts
+@@ -0,0 +1,267 @@
++import { execFile } from "child_process";
++import { existsSync, promises as fs } from "fs";
++import { basename, extname, join } from "path";
++import type {
++  PluginDiagnostic,
++  PluginPackageInfo,
++  PluginResourceCounts,
++  PluginResourceInfo,
++  PluginSettingSchema,
++  PluginsResponse,
++} from "@/lib/api-types";
++import { OMP_NOT_FOUND, resolveOmpBin } from "@/lib/omp/omp-cli";
++import { ensureAgentDir } from "@/lib/omp/paths";
++import { ANSI_RE, parseJsonLoose } from "@/lib/omp/plugins-cli";
++import { publicPluginActions, publicPluginSchema, type OmpActionDeclaration } from "@/lib/omp/plugin-config";
++import { createChildProcessEnvironment } from "@/lib/project-command-env";
++
++// Plugin management is delegated to the user's omp binary (`omp plugin ...`);
++// omp-web never embeds the Bun-only SDK. `--json` output shapes are mirrored
++// from oh-my-pi coding-agent src/cli/plugin-cli.ts + extensibility/plugins.
++
++export interface OmpPluginManifest {
++  name?: string;
++  version?: string;
++  description?: string;
++  tools?: string;
++  hooks?: string;
++  extensions?: string[];
++  commands?: string[];
++  features?: Record<string, unknown>;
++  settings?: Record<string, PluginSettingSchema>;
++  actions?: Record<string, OmpActionDeclaration>;
++}
++
++interface OmpNpmPlugin {
++  name: string;
++  version: string;
++  path: string;
++  manifest?: OmpPluginManifest;
++  enabledFeatures?: string[] | null;
++  enabled: boolean;
++}
++
++interface OmpMarketplaceEntry {
++  scope?: "user" | "project";
++  installPath?: string;
++  version?: string;
++  enabled?: boolean;
++}
++
++interface OmpMarketplacePlugin {
++  id: string;
++  scope?: "user" | "project";
++  entries?: OmpMarketplaceEntry[];
++  shadowedBy?: string;
++}
++
++interface OmpPluginList {
++  npm?: OmpNpmPlugin[];
++  marketplace?: OmpMarketplacePlugin[];
++}
++
++function emptyCounts(): PluginResourceCounts {
++  return { extensions: 0, skills: 0, prompts: 0, themes: 0 };
++}
++
++export function runOmp(
++  args: string[],
++  opts: { cwd?: string; timeout?: number } = {},
++): Promise<{ stdout: string; stderr: string }> {
++  const bin = resolveOmpBin();
++  if (!bin) {
++    return Promise.reject(new Error(OMP_NOT_FOUND));
++  }
++  const { promise, resolve, reject } = Promise.withResolvers<{ stdout: string; stderr: string }>();
++  execFile(
++    bin,
++    args,
++    {
++      cwd: opts.cwd,
++      timeout: opts.timeout ?? 60_000,
++      maxBuffer: 16 * 1024 * 1024,
++      env: createChildProcessEnvironment({ FORCE_COLOR: "0", NO_COLOR: "1" }),
++      windowsHide: true,
++    },
++    (error, stdout, stderr) => {
++      if (error) {
++        const detail = (stderr || stdout || error.message).replace(ANSI_RE, "").trim();
++        reject(new Error(detail.slice(-600) || `omp ${args.join(" ")} failed`));
++      } else {
++        resolve({ stdout, stderr });
++      }
++    },
++  );
++  return promise;
++}
++
++/** Best-effort scan of a plugin's skills/ directory (omp discovers plugin-root
++ * skills the same way) so the UI can show a resource count. */
++async function scanPluginSkills(pluginPath: string): Promise<PluginResourceInfo[]> {
++  const skillsDir = join(pluginPath, "skills");
++  let entries;
++  try {
++    const readDirectory = Reflect.get(fs, "readdir") as typeof fs.readdir;
++    entries = await readDirectory(skillsDir, { withFileTypes: true });
++  } catch {
++    return [];
++  }
++  const resources: PluginResourceInfo[] = [];
++  for (const entry of entries) {
++    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
++    const skillPath = join(skillsDir, entry.name, "SKILL.md");
++    if (existsSync(skillPath)) {
++      resources.push({
++        kind: "skill",
++        name: entry.name,
++        path: skillPath,
++        relativePath: join("skills", entry.name, "SKILL.md"),
++      });
++    }
++  }
++  return resources;
++}
++
++function manifestResources(pluginPath: string, manifest: OmpPluginManifest | undefined): PluginResourceInfo[] {
++  const resources: PluginResourceInfo[] = [];
++  const push = (kind: PluginResourceInfo["kind"], rel: string) => {
++    const file = basename(rel);
++    const ext = extname(file);
++    resources.push({
++      kind,
++      name: ext ? file.slice(0, -ext.length) : file,
++      path: join(pluginPath, rel),
++      relativePath: rel,
++    });
++  };
++  for (const rel of manifest?.extensions ?? []) push("extension", rel);
++  if (manifest?.tools) push("extension", manifest.tools);
++  if (manifest?.hooks) push("extension", manifest.hooks);
++  // omp "commands" (slash commands) are the closest analog of pi prompts.
++  for (const rel of manifest?.commands ?? []) push("prompt", rel);
++  return resources;
++}
++
++/** Read the installed package, not a request-supplied path. The list command's
++ * manifest is a fallback for packages whose package.json is temporarily unreadable. */
++export async function readInstalledManifest(pluginPath: string | undefined, fallback?: OmpPluginManifest): Promise<OmpPluginManifest | undefined> {
++  if (!pluginPath) return fallback;
++  try {
++    const pkg = JSON.parse(await fs.readFile(join(pluginPath, "package.json"), "utf8")) as { omp?: OmpPluginManifest; pi?: OmpPluginManifest };
++    return pkg.omp ?? pkg.pi ?? fallback;
++  } catch {
++    return fallback;
++  }
++}
++
++async function toNpmPackageInfo(plugin: OmpNpmPlugin): Promise<PluginPackageInfo> {
++  const manifest = await readInstalledManifest(plugin.path, plugin.manifest);
++  const resources = [
++    ...manifestResources(plugin.path, manifest),
++    ...(await scanPluginSkills(plugin.path)),
++  ];
++  const counts = emptyCounts();
++  for (const resource of resources) {
++    if (resource.kind === "extension") counts.extensions += 1;
++    else if (resource.kind === "skill") counts.skills += 1;
++    else if (resource.kind === "prompt") counts.prompts += 1;
++    else counts.themes += 1;
++  }
++  const installed = Boolean(plugin.path && existsSync(plugin.path));
++  const resourceCount = counts.extensions + counts.skills + counts.prompts + counts.themes;
++  return {
++    source: plugin.name,
++    scope: "global",
++    filtered: Array.isArray(plugin.enabledFeatures),
++    disabled: plugin.enabled === false,
++    installedPath: plugin.path || undefined,
++    packageName: plugin.name,
++    version: plugin.version || manifest?.version,
++    configuredVersion: undefined,
++    settings: publicPluginSchema(manifest?.settings),
++    actions: publicPluginActions(manifest?.actions),
++    counts,
++    resources,
++    status: plugin.enabled === false
++      ? "disabled"
++      : resourceCount > 0
++        ? "loaded"
++        : installed
++          ? "installed"
++          : "missing",
++  };
++}
++
++async function toMarketplacePackageInfo(plugin: OmpMarketplacePlugin): Promise<PluginPackageInfo> {
++  const entry = plugin.entries?.[0];
++  const installedPath = entry?.installPath;
++  const manifest = await readInstalledManifest(installedPath);
++  const installed = Boolean(installedPath && existsSync(installedPath));
++  const resources = installedPath ? await scanPluginSkills(installedPath) : [];
++  const counts = emptyCounts();
++  counts.skills = resources.length;
++  const disabled = entry?.enabled === false;
++  return {
++    source: plugin.id,
++    scope: plugin.scope === "project" ? "project" : "global",
++    filtered: false,
++    disabled,
++    installedPath: installedPath || undefined,
++    packageName: plugin.id,
++    version: entry?.version,
++    configuredVersion: undefined,
++    settings: publicPluginSchema(manifest?.settings),
++    actions: publicPluginActions(manifest?.actions),
++    counts,
++    resources,
++    status: disabled ? "disabled" : resources.length > 0 ? "loaded" : installed ? "installed" : "missing",
++  };
++}
++
++/** Without a cwd, the user level only (a cluster member's settings act on this machine's, spec K7): omp runs in its
++ * agent directory, where no project lies, and a project-scope entry is left out all the same. */
++export async function readPlugins(cwd: string | null): Promise<PluginsResponse> {
++  const diagnostics: PluginDiagnostic[] = [];
++  const packages: PluginPackageInfo[] = [];
++  const totals = emptyCounts();
++
++  try {
++    const { stdout } = await runOmp(["plugin", "list", "--json"], { cwd: cwd ?? ensureAgentDir(), timeout: 60_000 });
++    const list = parseJsonLoose<OmpPluginList>(stdout);
++    if (!list) {
++      diagnostics.push({
++        type: "error",
++        message: "Could not parse `omp plugin list --json` output.",
++      });
++    } else {
++      for (const plugin of list.npm ?? []) {
++        packages.push(await toNpmPackageInfo(plugin));
++      }
++      for (const plugin of list.marketplace ?? []) {
++        if (!cwd && plugin.scope === "project") continue;
++        const info = await toMarketplacePackageInfo(plugin);
++        if (plugin.shadowedBy) {
++          diagnostics.push({
++            type: "warning",
++            source: plugin.id,
++            message: `Shadowed by a ${plugin.shadowedBy}-scoped install of the same plugin.`,
++          });
++        }
++        packages.push(info);
++      }
++      for (const pkg of packages) {
++        totals.extensions += pkg.counts.extensions;
++        totals.skills += pkg.counts.skills;
++        totals.prompts += pkg.counts.prompts;
++        totals.themes += pkg.counts.themes;
++      }
++    }
++  } catch (error) {
++    diagnostics.push({
++      type: "error",
++      message: error instanceof Error ? error.message : String(error),
++    });
++  }
++
++  return { packages, totals, diagnostics };
++}
+diff --git a/lib/web-auth.test.mjs b/lib/web-auth.test.mjs
+index 8bb9ffd..7926f78 100644
+--- a/lib/web-auth.test.mjs
++++ b/lib/web-auth.test.mjs
+@@ -282,6 +282,15 @@ test("leaves Bun's dev bundles under /_bun/ public in dev only", () => {
+   });
+ });
+ 
++test("plugin configuration remains behind password and cross-origin protection", () => {
++  withEnvVars({ OMP_WEB_PASSWORD_HASH: PASSWORD_HASH }, () => {
++    assert.equal(gate("http://localhost:30177/api/plugin-config").status, 401);
++    assert.equal(gate("http://localhost:30177/api/plugin-config", { method: "POST" }).status, 401);
++    const crossOrigin = gate("http://localhost:30177/api/plugin-config", { method: "POST", headers: { Origin: "https://evil.example" } });
++    assert.equal(crossOrigin.status, 403);
++  });
++});
++
+ test("leaves the host link to its own bearer check, and nothing else under /api/hosts", () => {
+   withEnvVars({ OMP_WEB_PASSWORD_HASH: PASSWORD_HASH }, () => {
+     assert.equal(gate("http://localhost:30177/api/hosts/link"), "public");
+diff --git a/server/routes.ts b/server/routes.ts
+index d6cfea3..d15863d 100644
+--- a/server/routes.ts
++++ b/server/routes.ts
+@@ -47,6 +47,7 @@ import * as ompSettings from "@/app/api/omp-settings/route";
+ import * as ompUpdate from "@/app/api/omp-update/route";
+ import * as ompVersion from "@/app/api/omp-version/route";
+ import * as plugins from "@/app/api/plugins/route";
++import * as pluginConfig from "@/app/api/plugin-config/route";
+ import * as projectsClone from "@/app/api/projects/clone/route";
+ import * as projects from "@/app/api/projects/route";
+ import * as providerUsage from "@/app/api/provider-usage/route";
+@@ -150,6 +151,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
+   "omp-update": ompUpdate,
+   "omp-version": ompVersion,
+   "plugins": plugins,
++  "plugin-config": pluginConfig,
+   "projects/clone": projectsClone,
+   "projects": projects,
+   "provider-usage": providerUsage,

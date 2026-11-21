@@ -1,0 +1,462 @@
+--- a/src/extensibility/plugins/runtime-config.ts
++++ b/src/extensibility/plugins/runtime-config.ts
+@@ -1,7 +1,10 @@
+ import * as fs from "node:fs/promises";
+ import * as path from "node:path";
++import { isDeepStrictEqual } from "node:util";
++import { isEnoent } from "@oh-my-pi/pi-utils";
++import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
+ import { replaceFileAtomically } from "../../utils/atomic-file";
+-import type { PluginRuntimeConfig } from "./types";
++import type { PluginRuntimeConfig, ProjectPluginOverrides } from "./types";
+ 
+ /** Normalizes persisted plugin runtime config across legacy lockfile shapes. */
+ export function normalizePluginRuntimeConfig(config: Partial<PluginRuntimeConfig>): PluginRuntimeConfig {
+@@ -11,7 +14,56 @@
+ 	};
+ }
+ 
++/** Read config without converting malformed JSON into an empty configuration. */
++export async function readPluginRuntimeConfig(lockPath: string): Promise<PluginRuntimeConfig> {
++	try {
++		return normalizePluginRuntimeConfig(JSON.parse(await fs.readFile(lockPath, "utf8")));
++	} catch (error) {
++		if (isEnoent(error)) return normalizePluginRuntimeConfig({});
++		throw error;
++	}
++}
++
++type JsonObject = Record<string, unknown>;
++
++function isJsonObject(value: unknown): value is JsonObject {
++	return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
+ /**
++ * Merge local changes into the latest on-disk config. Objects are merged by
++ * key so independent nested edits survive; arrays and scalars are atomic.
++ */
++function mergeRuntimeConfigValue(baseline: unknown, local: unknown, current: unknown): unknown {
++	if (local === undefined) {
++		return baseline === undefined ? current : undefined;
++	}
++	if (baseline !== undefined && isDeepStrictEqual(local, baseline)) return current;
++	if (isJsonObject(local) && (current === undefined || isJsonObject(current))) {
++		const baselineObject = isJsonObject(baseline) ? baseline : {};
++		const currentObject = isJsonObject(current) ? current : {};
++		const result: JsonObject = {};
++		const keys = new Set([...Object.keys(baselineObject), ...Object.keys(local), ...Object.keys(currentObject)]);
++		for (const key of keys) {
++			const value = mergeRuntimeConfigValue(baselineObject[key], local[key], currentObject[key]);
++			if (value !== undefined) result[key] = value;
++		}
++		return result;
++	}
++	return local;
++}
++
++export function mergePluginRuntimeConfig(
++	baseline: PluginRuntimeConfig,
++	local: PluginRuntimeConfig,
++	current: PluginRuntimeConfig,
++): PluginRuntimeConfig {
++	return normalizePluginRuntimeConfig(
++		mergeRuntimeConfigValue(baseline, local, current) as Partial<PluginRuntimeConfig>,
++	);
++}
++
++/**
+  * Write a plugin runtime lockfile readable only by its owner.
+  *
+  * The lockfile holds plugin settings, and a setting a plugin marks `secret` is
+@@ -19,8 +71,7 @@
+  * 0600 sibling and renamed over the lockfile, so the credential never lands in
+  * an older, wider-mode inode another account may already hold open.
+  */
+-export async function writePluginRuntimeConfig(lockPath: string, config: PluginRuntimeConfig): Promise<void> {
+-	await fs.mkdir(path.dirname(lockPath), { recursive: true });
++async function writeConfigAtomically(lockPath: string, config: unknown): Promise<void> {
+ 	const tmpPath = `${lockPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+ 	try {
+ 		await fs.writeFile(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600, flag: "wx" });
+@@ -29,3 +80,36 @@
+ 		await fs.rm(tmpPath, { force: true }).catch(() => {});
+ 	}
+ }
++
++/** Serialize the complete read/merge/write transaction across processes. */
++export async function updatePluginRuntimeConfig(
++	lockPath: string,
++	baseline: PluginRuntimeConfig,
++	local: PluginRuntimeConfig,
++): Promise<PluginRuntimeConfig> {
++	await fs.mkdir(path.dirname(lockPath), { recursive: true });
++	return withFileLock(lockPath, async () => {
++		const current = await readPluginRuntimeConfig(lockPath);
++		const merged = mergePluginRuntimeConfig(baseline, local, current);
++		await writeConfigAtomically(lockPath, merged);
++		return merged;
++	});
++}
++
++/** Apply a project override mutation to the latest config while holding its lock. */
++export async function updateProjectPluginOverrides(
++	overridesPath: string,
++	mutate: (config: ProjectPluginOverrides) => void,
++): Promise<void> {
++	await fs.mkdir(path.dirname(overridesPath), { recursive: true });
++	await withFileLock(overridesPath, async () => {
++		let config: ProjectPluginOverrides = {};
++		try {
++			config = JSON.parse(await fs.readFile(overridesPath, "utf8"));
++		} catch (error) {
++			if (!isEnoent(error)) throw error;
++		}
++		mutate(config);
++		await writeConfigAtomically(overridesPath, config);
++	});
++}
+--- a/src/extensibility/plugins/manager.ts
++++ b/src/extensibility/plugins/manager.ts
+@@ -23,7 +23,12 @@
+ import { getInstalledPluginsRegistryPath, readInstalledPluginsRegistry } from "./marketplace/registry";
+ import { parsePluginId } from "./marketplace/types";
+ import { extractPackageName, parsePluginSpec } from "./parser";
+-import { normalizePluginRuntimeConfig, writePluginRuntimeConfig } from "./runtime-config";
++import {
++	normalizePluginRuntimeConfig,
++	readPluginRuntimeConfig,
++	updatePluginRuntimeConfig,
++	updateProjectPluginOverrides,
++} from "./runtime-config";
+ import type {
+ 	DoctorCheck,
+ 	DoctorOptions,
+@@ -156,6 +161,9 @@
+ 
+ export class PluginManager {
+ 	#runtimeConfig: PluginRuntimeConfig | null = null;
++	#runtimeBaseline: PluginRuntimeConfig | null = null;
++	#runtimeSaveQueue: Promise<void> = Promise.resolve();
++	#runtimeSaveVersion = 0;
+ 	#cwd: string;
+ 
+ 	constructor(cwd: string = getProjectDir()) {
+@@ -168,9 +176,8 @@
+ 
+ 	async #readRuntimeConfigAt(lockPath: string): Promise<PluginRuntimeConfig> {
+ 		try {
+-			return normalizePluginRuntimeConfig(await Bun.file(lockPath).json());
++			return await readPluginRuntimeConfig(lockPath);
+ 		} catch (err) {
+-			if (isEnoent(err)) return normalizePluginRuntimeConfig({});
+ 			logger.warn("Failed to load plugin runtime config", { path: lockPath, error: String(err) });
+ 			return normalizePluginRuntimeConfig({});
+ 		}
+@@ -182,14 +189,28 @@
+ 
+ 	async #ensureConfigLoaded(): Promise<PluginRuntimeConfig> {
+ 		if (!this.#runtimeConfig) {
+-			this.#runtimeConfig = await this.#loadRuntimeConfig();
++			const config = await this.#loadRuntimeConfig();
++			this.#runtimeConfig = config;
++			this.#runtimeBaseline = structuredClone(config);
+ 		}
+ 		return this.#runtimeConfig;
+ 	}
+ 
+ 	async #saveRuntimeConfig(): Promise<void> {
+ 		const config = await this.#ensureConfigLoaded();
+-		await writePluginRuntimeConfig(getPluginsLockfile(), config);
++		const baseline = structuredClone(this.#runtimeBaseline ?? config);
++		const local = structuredClone(config);
++		const version = ++this.#runtimeSaveVersion;
++		const save = async () => {
++			const merged = await updatePluginRuntimeConfig(getPluginsLockfile(), baseline, local);
++			this.#runtimeBaseline = structuredClone(merged);
++			// A newer queued save has already captured further local mutations.
++			// Do not replace that newer snapshot with this intermediate result.
++			if (version === this.#runtimeSaveVersion) this.#runtimeConfig = merged;
++		};
++		const result = this.#runtimeSaveQueue.then(save);
++		this.#runtimeSaveQueue = result.catch(() => {});
++		return result;
+ 	}
+ 
+ 	async #loadProjectOverrides(): Promise<ProjectPluginOverrides> {
+@@ -1024,7 +1045,15 @@
+ 	/**
+ 	 * Set a plugin setting value.
+ 	 */
+-	async setPluginSetting(name: string, key: string, value: unknown): Promise<void> {
++	async setPluginSetting(name: string, key: string, value: unknown, local = false): Promise<void> {
++		if (local) {
++			await updateProjectPluginOverrides(getProjectPluginOverridesPath(this.#cwd), config => {
++				config.settings ??= {};
++				config.settings[name] ??= {};
++				config.settings[name][key] = value;
++			});
++			return;
++		}
+ 		const config = await this.#ensureConfigLoaded();
+ 		if (!config.settings[name]) {
+ 			config.settings[name] = {};
+@@ -1036,7 +1065,13 @@
+ 	/**
+ 	 * Delete a plugin setting.
+ 	 */
+-	async deletePluginSetting(name: string, key: string): Promise<void> {
++	async deletePluginSetting(name: string, key: string, local = false): Promise<void> {
++		if (local) {
++			await updateProjectPluginOverrides(getProjectPluginOverridesPath(this.#cwd), config => {
++				if (config.settings?.[name]) delete config.settings[name][key];
++			});
++			return;
++		}
+ 		const config = await this.#ensureConfigLoaded();
+ 		if (config.settings[name]) {
+ 			delete config.settings[name][key];
+--- a/src/extensibility/plugins/marketplace/manager.ts
++++ b/src/extensibility/plugins/marketplace/manager.ts
+@@ -13,7 +13,7 @@
+ import { isEnoent, logger, pathIsWithin } from "@oh-my-pi/pi-utils";
+ import { expandTilde } from "../../../tools/path-utils";
+ import { linkPluginDirectory } from "../directory-link";
+-import { normalizePluginRuntimeConfig, writePluginRuntimeConfig } from "../runtime-config";
++import { normalizePluginRuntimeConfig, updatePluginRuntimeConfig } from "../runtime-config";
+ import type { PluginRuntimeConfig, PluginRuntimeState } from "../types";
+ 
+ import { cachePlugin, getCachedPluginPath, isValidVersionForCache } from "./cache";
+@@ -1010,6 +1010,8 @@
+ 
+ 	// ── Private helpers ───────────────────────────────────────────────────────
+ 
++	#runtimeConfigBaselines = new WeakMap<PluginRuntimeConfig, PluginRuntimeConfig>();
++
+ 	#runtimeRoot(scope: "user" | "project"): string {
+ 		return path.dirname(this.#registryPath(scope));
+ 	}
+@@ -1023,20 +1025,27 @@
+ 	}
+ 
+ 	async #loadRuntimeConfig(scope: "user" | "project"): Promise<PluginRuntimeConfig> {
++		let config: PluginRuntimeConfig;
+ 		try {
+-			return normalizePluginRuntimeConfig(await Bun.file(this.#runtimeLockPath(scope)).json());
++			config = normalizePluginRuntimeConfig(await Bun.file(this.#runtimeLockPath(scope)).json());
+ 		} catch (err) {
+-			if (isEnoent(err)) return normalizePluginRuntimeConfig({});
+-			logger.warn("Failed to load marketplace plugin runtime config", {
+-				path: this.#runtimeLockPath(scope),
+-				error: String(err),
+-			});
+-			return normalizePluginRuntimeConfig({});
++			if (isEnoent(err)) config = normalizePluginRuntimeConfig({});
++			else {
++				logger.warn("Failed to load marketplace plugin runtime config", {
++					path: this.#runtimeLockPath(scope),
++					error: String(err),
++				});
++				config = normalizePluginRuntimeConfig({});
++			}
+ 		}
++		this.#runtimeConfigBaselines.set(config, structuredClone(config));
++		return config;
+ 	}
+ 
+ 	async #writeRuntimeConfig(scope: "user" | "project", config: PluginRuntimeConfig): Promise<void> {
+-		await writePluginRuntimeConfig(this.#runtimeLockPath(scope), config);
++		const baseline = this.#runtimeConfigBaselines.get(config);
++		if (!baseline) throw new Error("Marketplace runtime config baseline is missing");
++		await updatePluginRuntimeConfig(this.#runtimeLockPath(scope), baseline, config);
+ 	}
+ 
+ 	async #resolvePluginPackageName(installPath: string, fallbackName: string): Promise<string> {
+--- a/src/cli/plugin-cli.ts
++++ b/src/cli/plugin-cli.ts
+@@ -1035,7 +1035,7 @@
+ 			}
+ 
+ 			refuseDryRun(flags, "config set");
+-			await manager.setPluginSetting(pluginName, key, value);
++			await manager.setPluginSetting(pluginName, key, value, flags.local);
+ 			console.log(chalk.green(`${theme.status.success} Set ${key}`));
+ 			break;
+ 		}
+@@ -1047,7 +1047,7 @@
+ 			}
+ 
+ 			refuseDryRun(flags, "config delete");
+-			await manager.deletePluginSetting(pluginName, key);
++			await manager.deletePluginSetting(pluginName, key, flags.local);
+ 			console.log(chalk.green(`${theme.status.success} Deleted ${key}`));
+ 			break;
+ 		}
+--- /dev/null
++++ b/src/extensibility/plugins/runtime-config.test.ts
+@@ -0,0 +1,165 @@
++import { afterEach, beforeEach, describe, expect, test } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { getPluginsLockfile, getProjectPluginOverridesPath, refreshDirsFromEnv } from "@oh-my-pi/pi-utils";
++import { PluginManager } from "./manager";
++import type { PluginRuntimeConfig } from "./types";
++
++const originalXdgDataHome = process.env.XDG_DATA_HOME;
++let tempDir: string;
++
++function initialConfig(): PluginRuntimeConfig {
++	return {
++		plugins: {
++			alpha: { version: "1.0.0", enabledFeatures: ["one"], enabled: true },
++			beta: { version: "2.0.0", enabledFeatures: null, enabled: true },
++		},
++		settings: {
++			alpha: { untouched: "keep", shared: "initial" },
++			beta: { nested: { left: 1, right: 2 } },
++		},
++	};
++}
++
++async function writeInitialConfig(config: PluginRuntimeConfig = initialConfig()): Promise<void> {
++	const lockPath = getPluginsLockfile();
++	await fs.mkdir(path.dirname(lockPath), { recursive: true });
++	await fs.writeFile(lockPath, JSON.stringify(config), { mode: 0o600 });
++}
++
++async function readConfig(): Promise<PluginRuntimeConfig> {
++	return JSON.parse(await fs.readFile(getPluginsLockfile(), "utf8"));
++}
++
++beforeEach(async () => {
++	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-plugin-config-lock-"));
++	process.env.XDG_DATA_HOME = tempDir;
++	// DirResolver only uses an XDG path once the application root exists.
++	await fs.mkdir(path.join(tempDir, "omp"), { recursive: true });
++	refreshDirsFromEnv();
++});
++
++afterEach(async () => {
++	if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
++	else process.env.XDG_DATA_HOME = originalXdgDataHome;
++	refreshDirsFromEnv();
++	await fs.rm(tempDir, { recursive: true, force: true });
++});
++
++describe("PluginManager runtime config persistence", () => {
++	test("merges independent managers' nested edits and repeated writes without losing unchanged fields", async () => {
++		await writeInitialConfig();
++		const first = new PluginManager(tempDir);
++		const second = new PluginManager(tempDir);
++		await Promise.all([first.getPluginSettings("alpha"), second.getPluginSettings("beta")]);
++
++		await Promise.all([
++			first.setEnabled("alpha", false),
++			second.setEnabledFeatures("alpha", null),
++			second.setEnabled("beta", false),
++		]);
++		for (let round = 0; round < 5; round++) {
++			await Promise.all([
++				first.setPluginSetting("alpha", "fromFirst", { round }),
++				second.setPluginSetting("beta", "fromSecond", `second-${round}`),
++			]);
++		}
++
++		const saved = await readConfig();
++		expect(saved).toEqual({
++			plugins: {
++				alpha: { version: "1.0.0", enabledFeatures: null, enabled: false },
++				beta: { version: "2.0.0", enabledFeatures: null, enabled: false },
++			},
++			settings: {
++				alpha: { untouched: "keep", shared: "initial", fromFirst: { round: 4 } },
++				beta: { nested: { left: 1, right: 2 }, fromSecond: "second-4" },
++			},
++		});
++		expect((await fs.stat(getPluginsLockfile())).mode & 0o777).toBe(0o600);
++	});
++
++	test("uses lock-order last-writer-wins for the same field", async () => {
++		await writeInitialConfig();
++		const first = new PluginManager(tempDir);
++		const second = new PluginManager(tempDir);
++		await Promise.all([first.getPluginSettings("alpha"), second.getPluginSettings("alpha")]);
++
++		await first.setPluginSetting("alpha", "shared", "first");
++		await second.setPluginSetting("alpha", "shared", "second");
++
++		expect((await readConfig()).settings.alpha.shared).toBe("second");
++	});
++
++	test("does not resurrect a deletion when another manager adds a setting", async () => {
++		await writeInitialConfig();
++		const first = new PluginManager(tempDir);
++		const second = new PluginManager(tempDir);
++		await Promise.all([first.getPluginSettings("alpha"), second.getPluginSettings("alpha")]);
++
++		await first.deletePluginSetting("alpha", "untouched");
++		await second.setPluginSetting("alpha", "externalAddition", true);
++
++		expect((await readConfig()).settings.alpha).toEqual({ shared: "initial", externalAddition: true });
++	});
++
++	test("keeps project settings isolated and reveals global values after local deletion", async () => {
++		await writeInitialConfig();
++		const manager = new PluginManager(tempDir);
++		await manager.setPluginSetting("alpha", "shared", "global");
++		await manager.setPluginSetting("alpha", "globalOnly", "global-only");
++		await manager.setPluginSetting("alpha", "shared", "project", true);
++		await manager.setPluginSetting("alpha", "localOnly", "project-only", true);
++
++		expect(await manager.getPluginSettings("alpha")).toEqual({
++			untouched: "keep",
++			shared: "project",
++			globalOnly: "global-only",
++			localOnly: "project-only",
++		});
++		expect((await readConfig()).settings.alpha).toEqual({
++			untouched: "keep",
++			shared: "global",
++			globalOnly: "global-only",
++		});
++
++		await manager.deletePluginSetting("alpha", "shared", true);
++		expect((await manager.getPluginSettings("alpha")).shared).toBe("global");
++	});
++
++	test("locks project override read-modify-write across independent managers", async () => {
++		await writeInitialConfig();
++		const first = new PluginManager(tempDir);
++		const second = new PluginManager(tempDir);
++		await first.setPluginSetting("alpha", "obsolete", true, true);
++
++		for (let round = 0; round < 5; round++) {
++			await Promise.all([
++				first.setPluginSetting("alpha", "fromFirst", round, true),
++				second.setPluginSetting("alpha", "fromSecond", round, true),
++			]);
++		}
++		await Promise.all([
++			first.deletePluginSetting("alpha", "obsolete", true),
++			second.setPluginSetting("alpha", "externalAddition", "project", true),
++		]);
++
++		const overridesPath = getProjectPluginOverridesPath(tempDir);
++		const overrides = JSON.parse(await fs.readFile(overridesPath, "utf8"));
++		expect(overrides.settings.alpha).toEqual({ fromFirst: 4, fromSecond: 4, externalAddition: "project" });
++		expect((await fs.stat(overridesPath)).mode & 0o777).toBe(0o600);
++		expect((await readConfig()).settings.alpha).toEqual({ untouched: "keep", shared: "initial" });
++	});
++
++	test("refuses to overwrite malformed JSON with an empty config", async () => {
++		const lockPath = getPluginsLockfile();
++		await fs.mkdir(path.dirname(lockPath), { recursive: true });
++		const malformed = '{"plugins":';
++		await fs.writeFile(lockPath, malformed, { mode: 0o600 });
++		const manager = new PluginManager(tempDir);
++
++		await expect(manager.setPluginSetting("alpha", "newValue", true)).rejects.toThrow();
++		expect(await fs.readFile(lockPath, "utf8")).toBe(malformed);
++	});
++});

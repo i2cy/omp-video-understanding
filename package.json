@@ -1,0 +1,144 @@
+{
+  "name": "omp-video-understanding",
+  "version": "0.1.0",
+  "description": "Native video understanding for OMP through vLLM video_url",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./actions": "./src/actions.ts",
+    "./config": "./src/config.ts"
+  },
+  "files": ["src", "fixtures", "README.md"],
+  "scripts": {
+    "test": "bun test tests",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "test:connection": "bun src/cli.ts test-connection",
+    "verify:native": "bun src/cli.ts verify-native",
+    "verify:backend": "bun scripts/verify-backend.ts"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=19.0.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "19.0.0",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "omp": {
+    "name": "Native Video Understanding",
+    "description": "Send authorized videos to a configured vLLM native video_url backend",
+    "extensions": ["./src/index.ts"],
+    "actions": {
+      "test-connection": {
+        "module": "./src/actions.ts",
+        "export": "testConnection",
+        "description": "Check API reachability, authentication, and exact model availability"
+      },
+      "verify-native-video": {
+        "module": "./src/actions.ts",
+        "export": "verifyNativeVideo",
+        "description": "Verify temporal understanding with the bundled native video_url motion fixture"
+      }
+    },
+    "settings": {
+      "schemaVersion": {
+        "type": "number",
+        "default": 1,
+        "min": 1,
+        "max": 1,
+        "description": "Configuration schema version"
+      },
+      "enabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable the video_understand tool"
+      },
+      "backendType": {
+        "type": "enum",
+        "values": ["vllm-video-url"],
+        "default": "vllm-video-url",
+        "description": "Native video backend protocol"
+      },
+      "baseUrl": {
+        "type": "string",
+        "default": "",
+        "description": "Trusted OpenAI-compatible API base URL, for example http://host:8000/v1"
+      },
+      "model": {
+        "type": "string",
+        "default": "",
+        "description": "Configured native-video model identifier"
+      },
+      "apiKey": {
+        "type": "string",
+        "secret": true,
+        "env": "OMP_VIDEO_API_KEY",
+        "description": "Optional backend API key; write-only in the WebUI"
+      },
+      "timeoutSeconds": {
+        "type": "number",
+        "default": 180,
+        "min": 1,
+        "max": 3600,
+        "step": 1,
+        "description": "Overall per-call deadline in seconds"
+      },
+      "maxMediaBytes": {
+        "type": "number",
+        "default": 67108864,
+        "min": 1024,
+        "max": 536870912,
+        "step": 1,
+        "description": "Maximum original media size in bytes"
+      },
+      "maxDurationSeconds": {
+        "type": "number",
+        "default": 600,
+        "min": 1,
+        "max": 3600,
+        "step": 1,
+        "description": "Maximum video duration in seconds"
+      },
+      "maxOutputTokens": {
+        "type": "number",
+        "default": 1024,
+        "min": 1,
+        "max": 8192,
+        "step": 1,
+        "description": "Maximum backend output tokens per call"
+      },
+      "concurrency": {
+        "type": "number",
+        "default": 1,
+        "min": 1,
+        "max": 8,
+        "step": 1,
+        "description": "Maximum concurrent calls; excess calls fail immediately"
+      },
+      "allowLocalFiles": {
+        "type": "boolean",
+        "default": true,
+        "description": "Allow files under canonical localRoots"
+      },
+      "localRoots": {
+        "type": "string",
+        "default": "",
+        "description": "JSON array of absolute directories authorized for local video reads"
+      },
+      "allowRemoteUrls": {
+        "type": "boolean",
+        "default": false,
+        "description": "Allow HTTPS video downloads from allowedRemoteDomains"
+      },
+      "allowedRemoteDomains": {
+        "type": "string",
+        "default": "",
+        "description": "JSON array of exact HTTPS hostnames authorized for video downloads"
+      }
+    }
+  }
+}
