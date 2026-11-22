@@ -10,7 +10,7 @@
     "./actions": "./src/actions.ts",
     "./config": "./src/config.ts"
   },
-  "files": ["src", "fixtures", "README.md"],
+  "files": ["src", "fixtures", "README.md", "CHANGELOG.md"],
   "scripts": {
     "test": "bun test tests",
     "typecheck": "tsc --noEmit",
