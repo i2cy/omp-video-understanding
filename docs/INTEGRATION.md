@@ -30,6 +30,8 @@
 
 WebUI 不直接读写 OMP 锁文件，不包含 vLLM 请求、视频解码、data URL 或语义判定。动作由插件包的 `omp.actions` 声明并在服务端受控加载；浏览器只能选择 action id，不能提供模块、export 或命令行。
 
+插件 CLI 可通过 `OMP_WEB_PLUGIN_OMP_BIN` 指向独立部署的 OMP。生产使用该变量选择全局 v19，避免为了配置锁实现而替换 ompweb pinned 的聊天 runner 或改变其 RPC 协议。
+
 ## 生效与运维边界
 
 - baseUrl、model、key、limits、来源配置：新调用读取新快照，运行中调用不变。

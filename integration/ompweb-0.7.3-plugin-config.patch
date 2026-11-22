@@ -1915,12 +1915,45 @@ index 0000000..958bdbc
 +  }
 +  return json;
 +}
+diff --git a/lib/omp/plugin-management.test.mjs b/lib/omp/plugin-management.test.mjs
+new file mode 100644
+index 0000000..21e1f5c
+--- /dev/null
++++ b/lib/omp/plugin-management.test.mjs
+@@ -0,0 +1,27 @@
++import assert from "node:assert/strict";
++import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import test from "node:test";
++import { runOmp } from "./plugin-management.ts";
++
++test("plugin configuration can use an independent OMP without replacing the chat runner", async () => {
++  const directory = await mkdtemp(path.join(tmpdir(), "omp-plugin-runner-"));
++  const executable = path.join(directory, "plugin-omp");
++  const previousPluginBin = process.env.OMP_WEB_PLUGIN_OMP_BIN;
++  const previousRunnerBin = process.env.OMP_WEB_OMP_BIN;
++  try {
++    await writeFile(executable, "#!/usr/bin/env node\nconsole.log(JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd() }));\n", { mode: 0o700 });
++    await chmod(executable, 0o700);
++    process.env.OMP_WEB_PLUGIN_OMP_BIN = executable;
++    process.env.OMP_WEB_OMP_BIN = path.join(directory, "chat-runner-must-not-be-used");
++    const { stdout } = await runOmp(["plugin", "config", "validate"], { cwd: directory });
++    assert.deepEqual(JSON.parse(stdout), { args: ["plugin", "config", "validate"], cwd: directory });
++  } finally {
++    if (previousPluginBin === undefined) delete process.env.OMP_WEB_PLUGIN_OMP_BIN;
++    else process.env.OMP_WEB_PLUGIN_OMP_BIN = previousPluginBin;
++    if (previousRunnerBin === undefined) delete process.env.OMP_WEB_OMP_BIN;
++    else process.env.OMP_WEB_OMP_BIN = previousRunnerBin;
++    await rm(directory, { recursive: true, force: true });
++  }
++});
 diff --git a/lib/omp/plugin-management.ts b/lib/omp/plugin-management.ts
 new file mode 100644
-index 0000000..8220e7a
+index 0000000..1253f4f
 --- /dev/null
 +++ b/lib/omp/plugin-management.ts
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,269 @@
 +import { execFile } from "child_process";
 +import { existsSync, promises as fs } from "fs";
 +import { basename, extname, join } from "path";
@@ -1991,7 +2024,9 @@ index 0000000..8220e7a
 +  args: string[],
 +  opts: { cwd?: string; timeout?: number } = {},
 +): Promise<{ stdout: string; stderr: string }> {
-+  const bin = resolveOmpBin();
++  // Plugin configuration can use a separately deployed OMP without replacing
++  // the pinned chat runner and its RPC protocol.
++  const bin = process.env.OMP_WEB_PLUGIN_OMP_BIN ?? resolveOmpBin();
 +  if (!bin) {
 +    return Promise.reject(new Error(OMP_NOT_FOUND));
 +  }

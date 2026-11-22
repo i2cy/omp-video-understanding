@@ -82,6 +82,7 @@ bun run verify:native
 ## 资源与安全
 
 - `timeoutSeconds` 是获取、校验和推理共用的总体 deadline；取消会关闭媒体流和 HTTP 请求。
+- `maxOutputTokens` 同时覆盖 reasoning 与最终答案；当前 Qwen 推理模型建议设为 2048，避免预算全部被 reasoning 消耗后截断。
 - `maxMediaBytes` 同时约束原始文件与实际下载字节；base64/JSON 膨胀另有派生上限。
 - `maxDurationSeconds` 通过 ffprobe 校验；ffprobe 不用于语义抽帧。
 - `concurrency` 使用固定容量、非排队策略；超限立即返回 `concurrency_limit`。

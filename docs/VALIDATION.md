@@ -17,7 +17,7 @@
 
 - `npm run typecheck`：通过。
 - `npm run lint`：0 error；7 个既有 React hook warning。
-- 新增/相关测试 54 个通过，0 失败，覆盖 schema、secret、串行写、action、认证、导航和结构化失败状态。
+- 新增/相关测试 55 个通过，0 失败，覆盖 schema、secret、串行写、action、认证、导航和结构化失败状态。
 - `npm run build`：通过，构建 104 个文件；CSS 构建有既有 `::highlight` warning。
 - 上游全量 `npm test`：4691 通过、82 失败。失败包含当前服务容器不允许创建独立 systemd scope 的宿主更新用例；本次相关测试没有失败。不将该全量结果记为通过。
 - 补丁对干净 ompweb v0.7.3 检出的 `git apply --check` 通过。
@@ -53,6 +53,15 @@ bun run verify:backend
 6. 一次真实后端调用达到 90 秒 deadline，页面正确显示红色 `timeout`，而不是成功；后续同一动作成功。
 7. 验证结束后已关闭浏览器页并停止临时服务。
 
-## 部署状态
+## 主运行时部署与生产验收
 
-`integration/*.patch` 是已验证的交付物。当前已安装的 OMP/ompweb 未应用这些补丁；如需切换主运行时，应由远端运维备份、应用、重建并按需重启，且保留回滚。
+Cody 已从 pristine 源码构建产物完成正式部署，并保留同盘回滚备份：
+
+- `pi-coding-agent.bak-3eb55dbb-20261122T140130`
+- `ompweb.bak-3eb55dbb-20261122T140130`
+
+OMP 与 ompweb 整树 SHA-256 复核通过。`ompweb.service` 使用 `OMP_WEB_PLUGIN_OMP_BIN=/home/icy/.npm-global/bin/omp`，仅插件配置 CLI 使用全局 v19；聊天 `ompweb-omp` runner 未替换，host 未重启。仅主 ompweb 完成重启，认证后的 `/api/plugins` 与 `/api/plugin-config` 均返回 200。
+
+生产页面已验证：插件配置页可达、连接测试返回 reachable、Web 保存与刷新持久化正常。1024 token 的一次原生验证被 reasoning 耗尽并正确报告截断；通过页面保存 `maxOutputTokens=2048` 后，原生验证返回 `nativeVideoVerified: true`，答案覆盖向右与黑→红，usage 和 `finishReason=stop` 完整。全字段保存逐次启动 CLI，实测约 90 秒，保存探针应允许最多 120 秒。
+
+临时登录 cookie 文件与浏览器 cookie 均已删除。两个回滚备份保留到下一版本。
